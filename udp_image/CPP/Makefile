@@ -8,8 +8,5 @@ OPENCV_FLAGS = `pkg-config --cflags --libs opencv4`
 all:
 	$(CXX) $(SRC) -o $(TARGET) $(CXXFLAGS) $(OPENCV_FLAGS)
 
-run:
-	./$(TARGET)
-
 clean:
 	rm -f $(TARGET)
