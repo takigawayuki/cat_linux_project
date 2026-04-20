@@ -15,6 +15,7 @@
 #define HEIGHT         480
 
 #define TOTAL_PACKETS  961
+#define IMAGE_PACKETS  960
 #define BATCH          128
 
 #ifndef SO_RCVBUFFORCE
@@ -28,8 +29,10 @@ static std::atomic<bool> g_new_frame{false};
 
 static std::atomic<int> g_x1{0}, g_y1{0}, g_x2{WIDTH}, g_y2{HEIGHT};
 
-static std::atomic<int>    g_frame_cnt{0};
-static std::atomic<double> g_fps{0.0};
+// ===== 接收统计 =====
+static uint8_t received[TOTAL_PACKETS] = {0};
+static int received_cnt = 0;
+static int pkt_cnt = 0;
 
 // ---- 显示线程 ----
 void display_thread()
@@ -78,7 +81,7 @@ int main()
     addr.sin_addr.s_addr = INADDR_ANY;
     bind(sockfd, (struct sockaddr *)&addr, sizeof(addr));
 
-    std::cout << "UDP接收启动 (半行模式-修复版)" << std::endl;
+    std::cout << "UDP接收启动 (最终稳定版)" << std::endl;
 
     std::thread disp(display_thread);
     disp.detach();
@@ -97,8 +100,6 @@ int main()
     auto last_time = std::chrono::high_resolution_clock::now();
     int frame_cnt  = 0;
 
-    int pkt_cnt = 0;
-
     while (true)
     {
         int ret = recvmmsg(sockfd, msgs.data(), BATCH, MSG_WAITFORONE, NULL);
@@ -113,21 +114,52 @@ int main()
             uint32_t pkt = ntohl(*(uint32_t*)buf);
             if (pkt == 0 || pkt > TOTAL_PACKETS) continue;
 
-            // ---- 调试：确认收包 ----
-            static int dbg = 0;
-            if (++dbg % 300 == 0)
-                std::cout << "pkt=" << pkt << std::endl;
+            uint8_t* payload = buf + 4;
 
-            uint8_t* payload     = buf + 4;
+            // ===== 统计 =====
+            if (!received[pkt]) {
+                received[pkt] = 1;
+                received_cnt++;
+            }
 
-            // ---- ROI包 ----
-            if (pkt == TOTAL_PACKETS) {
+            pkt_cnt++;
+
+            // ===== ROI包（强触发）=====
+            if (pkt == TOTAL_PACKETS)
+            {
                 if (len >= 12) {
                     g_x1 = ntohs(*(uint16_t*)(payload + 0));
                     g_y1 = ntohs(*(uint16_t*)(payload + 2));
                     g_x2 = ntohs(*(uint16_t*)(payload + 4));
                     g_y2 = ntohs(*(uint16_t*)(payload + 6));
                 }
+
+                // ⭐ 用ROI包作为帧结束（最可靠）
+                {
+                    std::lock_guard<std::mutex> lk(g_swap_mtx);
+                    std::swap(g_front, g_back);
+                    g_new_frame.store(true, std::memory_order_relaxed);
+                }
+
+                frame_cnt++;
+
+                auto now = std::chrono::high_resolution_clock::now();
+                double fps = frame_cnt /
+                    std::chrono::duration<double>(now - last_time).count();
+
+                float ratio = received_cnt / (float)IMAGE_PACKETS;
+
+                std::cout << "\rFrame " << frame_cnt
+                          << " FPS: " << fps
+                          << " recv: " << received_cnt << "/960"
+                          << " (" << ratio * 100 << "%)"
+                          << std::flush;
+
+                // 清空
+                memset(received, 0, sizeof(received));
+                received_cnt = 0;
+                pkt_cnt = 0;
+
                 continue;
             }
 
@@ -137,11 +169,10 @@ int main()
 
             uint16_t* pixels;
 
-            if (pkt == 1) {
-                pixels = (uint16_t*)(payload + 8); // 跳帧头
-            } else {
+            if (pkt == 1)
+                pixels = (uint16_t*)(payload + 8);
+            else
                 pixels = (uint16_t*)payload;
-            }
 
             if (row < 0 || row >= HEIGHT) continue;
 
@@ -159,9 +190,8 @@ int main()
                 row_ptr[idx][2] = ((p >> 11) & 0x1F) << 3;
             }
 
-            // ===== 改成周期刷新（防卡死）=====
-            pkt_cnt++;
-            if (pkt_cnt >= 200)
+            // ===== 兜底触发（防ROI丢失）=====
+            if (pkt_cnt > 400)
             {
                 {
                     std::lock_guard<std::mutex> lk(g_swap_mtx);
@@ -170,14 +200,6 @@ int main()
                 }
 
                 pkt_cnt = 0;
-                frame_cnt++;
-
-                auto now = std::chrono::high_resolution_clock::now();
-                double fps = frame_cnt /
-                    std::chrono::duration<double>(now - last_time).count();
-
-                std::cout << "\rFrame " << frame_cnt
-                          << " FPS: " << fps << std::flush;
             }
         }
     }
