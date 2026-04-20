@@ -14,7 +14,6 @@
 #define WIDTH          640
 #define HEIGHT         480
 
-// ⚠️ 新协议：960 + 1
 #define TOTAL_PACKETS  961
 #define BATCH          128
 
@@ -36,6 +35,7 @@ static std::atomic<double> g_fps{0.0};
 void display_thread()
 {
     cv::Mat show;
+
     while (true)
     {
         if (!g_new_frame.load(std::memory_order_relaxed)) {
@@ -78,7 +78,7 @@ int main()
     addr.sin_addr.s_addr = INADDR_ANY;
     bind(sockfd, (struct sockaddr *)&addr, sizeof(addr));
 
-    std::cout << "UDP接收启动 (半行模式)" << std::endl;
+    std::cout << "UDP接收启动 (半行模式-修复版)" << std::endl;
 
     std::thread disp(display_thread);
     disp.detach();
@@ -97,6 +97,8 @@ int main()
     auto last_time = std::chrono::high_resolution_clock::now();
     int frame_cnt  = 0;
 
+    int pkt_cnt = 0;
+
     while (true)
     {
         int ret = recvmmsg(sockfd, msgs.data(), BATCH, MSG_WAITFORONE, NULL);
@@ -111,12 +113,16 @@ int main()
             uint32_t pkt = ntohl(*(uint32_t*)buf);
             if (pkt == 0 || pkt > TOTAL_PACKETS) continue;
 
+            // ---- 调试：确认收包 ----
+            static int dbg = 0;
+            if (++dbg % 300 == 0)
+                std::cout << "pkt=" << pkt << std::endl;
+
             uint8_t* payload     = buf + 4;
-            int      payload_len = len - 4;
 
             // ---- ROI包 ----
             if (pkt == TOTAL_PACKETS) {
-                if (payload_len >= 8) {
+                if (len >= 12) {
                     g_x1 = ntohs(*(uint16_t*)(payload + 0));
                     g_y1 = ntohs(*(uint16_t*)(payload + 2));
                     g_x2 = ntohs(*(uint16_t*)(payload + 4));
@@ -125,22 +131,15 @@ int main()
                 continue;
             }
 
-            // ====== 核心修改：半行解析 ======
-
-            // 每2包=1行
+            // ===== 半行解析 =====
             int row = (pkt - 1) / 2;
-
-            // 奇数包=前半行，偶数包=后半行
             bool is_first_half = ((pkt - 1) % 2 == 0);
 
             uint16_t* pixels;
 
             if (pkt == 1) {
-                // 第一包特殊（有帧头+分辨率）
-                if (payload_len < 8 + (WIDTH/2)*2) continue;
-                pixels = (uint16_t*)(payload + 8);
+                pixels = (uint16_t*)(payload + 8); // 跳帧头
             } else {
-                if (payload_len < (WIDTH/2)*2) continue;
                 pixels = (uint16_t*)payload;
             }
 
@@ -153,7 +152,6 @@ int main()
 
             for (int i = 0; i < count; i++) {
                 uint16_t p = ntohs(pixels[i]);
-
                 int idx = start + i;
 
                 row_ptr[idx][0] = (p & 0x1F) << 3;
@@ -161,8 +159,9 @@ int main()
                 row_ptr[idx][2] = ((p >> 11) & 0x1F) << 3;
             }
 
-            // ====== 一帧完成：最后一行 + 后半包 ======
-            if (row == HEIGHT - 1 && !is_first_half)
+            // ===== 改成周期刷新（防卡死）=====
+            pkt_cnt++;
+            if (pkt_cnt >= 200)
             {
                 {
                     std::lock_guard<std::mutex> lk(g_swap_mtx);
@@ -170,7 +169,9 @@ int main()
                     g_new_frame.store(true, std::memory_order_relaxed);
                 }
 
+                pkt_cnt = 0;
                 frame_cnt++;
+
                 auto now = std::chrono::high_resolution_clock::now();
                 double fps = frame_cnt /
                     std::chrono::duration<double>(now - last_time).count();
