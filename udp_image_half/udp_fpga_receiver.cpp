@@ -13,23 +13,22 @@
 #define PORT           1234
 #define WIDTH          640
 #define HEIGHT         480
-#define TOTAL_PACKETS  481
+
+// ⚠️ 新协议：960 + 1
+#define TOTAL_PACKETS  961
 #define BATCH          128
 
 #ifndef SO_RCVBUFFORCE
 #define SO_RCVBUFFORCE 33
 #endif
 
-// 双缓冲：接收线程写 back，显示线程读 front
 static cv::Mat g_front(HEIGHT, WIDTH, CV_8UC3, cv::Scalar(0));
 static cv::Mat g_back(HEIGHT, WIDTH,  CV_8UC3, cv::Scalar(0));
 static std::mutex g_swap_mtx;
 static std::atomic<bool> g_new_frame{false};
 
-// ROI（接收线程写，显示线程读，精度要求不高，atomic 足够）
 static std::atomic<int> g_x1{0}, g_y1{0}, g_x2{WIDTH}, g_y2{HEIGHT};
 
-// FPS 统计
 static std::atomic<int>    g_frame_cnt{0};
 static std::atomic<double> g_fps{0.0};
 
@@ -73,22 +72,17 @@ int main()
     if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUFFORCE, &buf_size, sizeof(buf_size)) < 0)
         setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
 
-    int actual = 0; socklen_t alen = sizeof(actual);
-    getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &actual, &alen);
-
     struct sockaddr_in addr{};
     addr.sin_family      = AF_INET;
     addr.sin_port        = htons(PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
     bind(sockfd, (struct sockaddr *)&addr, sizeof(addr));
 
-    std::cout << "UDP接收启动: port=" << PORT
-              << "  RCVBUF=" << actual / 1024 << " KB" << std::endl;
+    std::cout << "UDP接收启动 (半行模式)" << std::endl;
 
     std::thread disp(display_thread);
     disp.detach();
 
-    // 批量接收缓冲
     std::vector<std::vector<uint8_t>> buffers(BATCH, std::vector<uint8_t>(2048));
     std::vector<iovec>   iov(BATCH);
     std::vector<mmsghdr> msgs(BATCH);
@@ -99,9 +93,6 @@ int main()
         msgs[i].msg_hdr.msg_iov    = &iov[i];
         msgs[i].msg_hdr.msg_iovlen = 1;
     }
-
-    std::vector<uint8_t> received(HEIGHT + 1, 0);
-    int rows_received = 0;
 
     auto last_time = std::chrono::high_resolution_clock::now();
     int frame_cnt  = 0;
@@ -123,7 +114,7 @@ int main()
             uint8_t* payload     = buf + 4;
             int      payload_len = len - 4;
 
-            // ROI 包
+            // ---- ROI包 ----
             if (pkt == TOTAL_PACKETS) {
                 if (payload_len >= 8) {
                     g_x1 = ntohs(*(uint16_t*)(payload + 0));
@@ -134,33 +125,44 @@ int main()
                 continue;
             }
 
-            int row = pkt - 1;
-            if (row < 0 || row >= HEIGHT) continue;
+            // ====== 核心修改：半行解析 ======
+
+            // 每2包=1行
+            int row = (pkt - 1) / 2;
+
+            // 奇数包=前半行，偶数包=后半行
+            bool is_first_half = ((pkt - 1) % 2 == 0);
 
             uint16_t* pixels;
+
             if (pkt == 1) {
-                if (payload_len < 8 + WIDTH * 2) continue;
+                // 第一包特殊（有帧头+分辨率）
+                if (payload_len < 8 + (WIDTH/2)*2) continue;
                 pixels = (uint16_t*)(payload + 8);
             } else {
-                if (payload_len < WIDTH * 2) continue;
+                if (payload_len < (WIDTH/2)*2) continue;
                 pixels = (uint16_t*)payload;
             }
 
-            if (!received[pkt]) {
-                received[pkt] = 1;
-                rows_received++;
-            }
+            if (row < 0 || row >= HEIGHT) continue;
 
             cv::Vec3b* row_ptr = g_back.ptr<cv::Vec3b>(row);
-            for (int i = 0; i < WIDTH; i++) {
+
+            int start = is_first_half ? 0 : WIDTH / 2;
+            int count = WIDTH / 2;
+
+            for (int i = 0; i < count; i++) {
                 uint16_t p = ntohs(pixels[i]);
-                row_ptr[i][0] = (p & 0x1F) << 3;
-                row_ptr[i][1] = ((p >> 5) & 0x3F) << 2;
-                row_ptr[i][2] = ((p >> 11) & 0x1F) << 3;
+
+                int idx = start + i;
+
+                row_ptr[idx][0] = (p & 0x1F) << 3;
+                row_ptr[idx][1] = ((p >> 5) & 0x3F) << 2;
+                row_ptr[idx][2] = ((p >> 11) & 0x1F) << 3;
             }
 
-            // 收到最后一行 → 交换缓冲，更新统计
-            if (row == HEIGHT - 1)
+            // ====== 一帧完成：最后一行 + 后半包 ======
+            if (row == HEIGHT - 1 && !is_first_half)
             {
                 {
                     std::lock_guard<std::mutex> lk(g_swap_mtx);
@@ -174,11 +176,7 @@ int main()
                     std::chrono::duration<double>(now - last_time).count();
 
                 std::cout << "\rFrame " << frame_cnt
-                          << " rows: " << rows_received << "/" << HEIGHT
                           << " FPS: " << fps << std::flush;
-
-                std::fill(received.begin(), received.end(), 0);
-                rows_received = 0;
             }
         }
     }
