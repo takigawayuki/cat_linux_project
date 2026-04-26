@@ -1,0 +1,10 @@
+# vscode
+.vscode/
+
+# Python缓存
+__pycache__/
+*.pyc
+
+# 图片数据
+*.jpg
+*.png
