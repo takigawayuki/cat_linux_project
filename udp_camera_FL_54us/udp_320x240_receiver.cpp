@@ -36,37 +36,13 @@ static std::atomic<double> g_fps{0.0};
 static std::atomic<int> g_color_mode{0};  // 0~3 四种模式
 
 static void decode_pixel(cv::Vec3b& out, uint16_t p) {
-    uint8_t r5, g6, b5;
-
-    switch (g_color_mode.load()) {
-    case 0: // RGB565: R[15:11] G[10:5] B[4:0]
-        r5 = (p >> 11) & 0x1F;
-        g6 = (p >> 5)  & 0x3F;
-        b5 = p & 0x1F;
-        break;
-    case 1: // BGR565: B[15:11] G[10:5] R[4:0]
-        b5 = (p >> 11) & 0x1F;
-        g6 = (p >> 5)  & 0x3F;
-        r5 = p & 0x1F;
-        break;
-    case 2: // RGB565 字节序反转
-        p = (p >> 8) | (p << 8);
-        r5 = (p >> 11) & 0x1F;
-        g6 = (p >> 5)  & 0x3F;
-        b5 = p & 0x1F;
-        break;
-    case 3: // BGR565 字节序反转
-        p = (p >> 8) | (p << 8);
-        b5 = (p >> 11) & 0x1F;
-        g6 = (p >> 5)  & 0x3F;
-        r5 = p & 0x1F;
-        break;
-    }
-
-    // 正确的位扩展：复制高位到低位，而不是补零
-    out[2] = (r5 << 3) | (r5 >> 2);  // 5bit → 8bit
-    out[1] = (g6 << 2) | (g6 >> 4);  // 6bit → 8bit
-    out[0] = (b5 << 3) | (b5 >> 2);  // 5bit → 8bit
+    // RGB565 大端: R[15:11] G[10:5] B[4:0]
+    uint8_t r5 = (p >> 11) & 0x1F;
+    uint8_t g6 = (p >> 5)  & 0x3F;
+    uint8_t b5 = p & 0x1F;
+    out[2] = (r5 << 3) | (r5 >> 2);
+    out[1] = (g6 << 2) | (g6 >> 4);
+    out[0] = (b5 << 3) | (b5 >> 2);
 }
 
 
@@ -97,27 +73,12 @@ void display_thread()
                           cv::Scalar(0,255,0), 2);
 
         cv::imshow("FPGA 320x240", show);
-        int key = cv::waitKey(1);
-        if (key == 'm' || key == 'M') {
-            int m = (g_color_mode.load() + 1) % 4;
-            g_color_mode.store(m);
-            const char* names[] = {"RGB565","BGR565","RGB565-swapped","BGR565-swapped"};
-            fprintf(stderr, "\n[mode] %d: %s\n", m, names[m]);
-        }
+        cv::waitKey(1);
     }
 }
 
-int main(int argc, char** argv)
+int main()
 {
-    if (argc > 1) {
-        int mode = atoi(argv[1]);
-        if (mode >= 0 && mode <= 3) {
-            g_color_mode.store(mode);
-            const char* names[] = {"RGB565","BGR565","RGB565-swapped","BGR565-swapped"};
-            std::cout << "Color mode: " << mode << " (" << names[mode] << ")" << std::endl;
-        }
-    }
-
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 
     int buf_size = 64 * 1024 * 1024;
