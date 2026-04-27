@@ -7,6 +7,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <sys/socket.h>
 #include <opencv2/opencv.hpp>
 
@@ -20,46 +21,68 @@
 #define SO_RCVBUFFORCE 33
 #endif
 
-// 双缓冲：接收线程写 back，显示线程读 front
-static cv::Mat g_front(HEIGHT, WIDTH, CV_8UC3, cv::Scalar(0));
-static cv::Mat g_back(HEIGHT, WIDTH,  CV_8UC3, cv::Scalar(0));
-static std::mutex g_swap_mtx;
-static std::atomic<bool> g_new_frame{false};
+// raw 双缓冲（接收线程写 RGB565，解码线程读）
+static uint16_t g_raw[2][HEIGHT][WIDTH];
+static int      g_raw_write = 0;
+static std::mutex              g_raw_mtx;
+static std::condition_variable g_raw_cv;
+static bool                    g_raw_ready = false;
 
-// ROI（接收线程写，显示线程读，精度要求不高，atomic 足够）
+// RGB888 双缓冲（解码线程写，显示线程读）
+static cv::Mat g_front(HEIGHT, WIDTH, CV_8UC3, cv::Scalar(0));
+static cv::Mat g_back (HEIGHT, WIDTH, CV_8UC3, cv::Scalar(0));
+static std::mutex              g_disp_mtx;
+static std::condition_variable g_disp_cv;
+static bool                    g_disp_ready = false;
+
+// ROI
 static std::atomic<int> g_x1{0}, g_y1{0}, g_x2{WIDTH}, g_y2{HEIGHT};
 
-// FPS 统计
-static std::atomic<int>    g_frame_cnt{0};
-static std::atomic<double> g_fps{0.0};
+void decode_thread()
+{
+    while (true)
+    {
+        int idx;
+        {
+            std::unique_lock<std::mutex> lk(g_raw_mtx);
+            g_raw_cv.wait(lk, []{ return g_raw_ready; });
+            idx = 1 - g_raw_write;
+            g_raw_ready = false;
+        }
 
-static std::atomic<int> g_color_mode{0};  // 0~3 四种模式
+        uint16_t (*src)[WIDTH] = g_raw[idx];
+        for (int row = 0; row < HEIGHT; row++) {
+            cv::Vec3b* dst = g_back.ptr<cv::Vec3b>(row);
+            for (int i = 0; i < WIDTH; i++) {
+                uint16_t p = ntohs(src[row][i]);
+                uint8_t r5 = (p >> 11) & 0x1F;
+                uint8_t g6 = (p >> 5)  & 0x3F;
+                uint8_t b5 = p & 0x1F;
+                dst[i][2] = (r5 << 3) | (r5 >> 2);
+                dst[i][1] = (g6 << 2) | (g6 >> 4);
+                dst[i][0] = (b5 << 3) | (b5 >> 2);
+            }
+        }
 
-static void decode_pixel(cv::Vec3b& out, uint16_t p) {
-    // RGB565 大端: R[15:11] G[10:5] B[4:0]
-    uint8_t r5 = (p >> 11) & 0x1F;
-    uint8_t g6 = (p >> 5)  & 0x3F;
-    uint8_t b5 = p & 0x1F;
-    out[2] = (r5 << 3) | (r5 >> 2);
-    out[1] = (g6 << 2) | (g6 >> 4);
-    out[0] = (b5 << 3) | (b5 >> 2);
+        {
+            std::lock_guard<std::mutex> lk(g_disp_mtx);
+            std::swap(g_front, g_back);
+            g_disp_ready = true;
+        }
+        g_disp_cv.notify_one();
+    }
 }
-
 
 void display_thread()
 {
     cv::Mat show;
     while (true)
     {
-        if (!g_new_frame.load(std::memory_order_relaxed)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
-
         {
-            std::lock_guard<std::mutex> lk(g_swap_mtx);
+            std::unique_lock<std::mutex> lk(g_disp_mtx);
+            g_disp_cv.wait(lk, []{ return g_disp_ready; });
             g_front.copyTo(show);
-            g_new_frame.store(false, std::memory_order_relaxed);
+            g_disp_ready = false;
         }
 
         int x1 = g_x1, y1 = g_y1, x2 = g_x2, y2 = g_y2;
@@ -67,7 +90,6 @@ void display_thread()
         int xmax = std::min(WIDTH-1,  std::max(x1, x2));
         int ymin = std::max(0, std::min(y1, y2));
         int ymax = std::min(HEIGHT-1, std::max(y1, y2));
-
         if (xmax > xmin && ymax > ymin)
             cv::rectangle(show, cv::Point(xmin,ymin), cv::Point(xmax,ymax),
                           cv::Scalar(0,255,0), 2);
@@ -92,19 +114,17 @@ int main()
     addr.sin_family      = AF_INET;
     addr.sin_port        = htons(PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
-    bind(sockfd, (struct sockaddr *)&addr, sizeof(addr));
+    bind(sockfd, (struct sockaddr*)&addr, sizeof(addr));
 
     std::cout << "UDP接收启动: port=" << PORT
               << "  RCVBUF=" << actual / 1024 << " KB" << std::endl;
 
-    std::thread disp(display_thread);
-    disp.detach();
+    std::thread(decode_thread).detach();
+    std::thread(display_thread).detach();
 
-    // 批量接收缓冲
     std::vector<std::vector<uint8_t>> buffers(BATCH, std::vector<uint8_t>(2048));
     std::vector<iovec>   iov(BATCH);
     std::vector<mmsghdr> msgs(BATCH);
-
     for (int i = 0; i < BATCH; i++) {
         iov[i].iov_base = buffers[i].data();
         iov[i].iov_len  = buffers[i].size();
@@ -114,10 +134,9 @@ int main()
 
     std::vector<uint8_t> received(HEIGHT + 2, 0);
     int rows_received = 0;
-
-    auto last_time    = std::chrono::high_resolution_clock::now();
-    auto last_pkt_time = std::chrono::steady_clock::now();
-    int frame_cnt  = 0;
+    int frame_cnt = 0;
+    bool in_frame = false;
+    auto last_time = std::chrono::high_resolution_clock::now();
 
     long long dbg_pkts = 0;
     auto dbg_time = std::chrono::steady_clock::now();
@@ -131,7 +150,7 @@ int main()
         auto dbg_now = std::chrono::steady_clock::now();
         double dbg_elapsed = std::chrono::duration<double>(dbg_now - dbg_time).count();
         if (dbg_elapsed >= 3.0) {
-            fprintf(stderr, "\n[dbg] %.0f pkts/s  rows_received=%d\n",
+            fprintf(stderr, "\n[dbg] %.0f pkts/s  rows=%d\n",
                     dbg_pkts / dbg_elapsed, rows_received);
             dbg_pkts = 0;
             dbg_time = dbg_now;
@@ -149,7 +168,6 @@ int main()
             uint8_t* payload     = buf + 4;
             int      payload_len = len - 4;
 
-            // 最后一包：ROI坐标
             if (pkt == TOTAL_PACKETS) {
                 if (payload_len >= 8) {
                     g_x1 = ntohs(*(uint16_t*)(payload + 0));
@@ -160,17 +178,14 @@ int main()
                 continue;
             }
 
-            int row = pkt - 1;
+            int row = (int)pkt - 1;
             if (row < 0 || row >= HEIGHT) continue;
 
             uint16_t* pixels;
             if (pkt == 1) {
-                // 第一包：包含帧头和分辨率
                 if (payload_len < 8 + WIDTH * 2) continue;
-                // 跳过4字节帧头和4字节分辨率
                 pixels = (uint16_t*)(payload + 8);
             } else {
-                // 中间包：直接是图像数据
                 if (payload_len < WIDTH * 2) continue;
                 pixels = (uint16_t*)payload;
             }
@@ -180,30 +195,22 @@ int main()
                 rows_received++;
             }
 
-            cv::Vec3b* row_ptr = g_back.ptr<cv::Vec3b>(row);
-            for (int i = 0; i < WIDTH; i++) {
-                uint16_t p = ntohs(pixels[i]);
-                decode_pixel(row_ptr[i], p);
-            }
+            memcpy(g_raw[g_raw_write][row], pixels, WIDTH * 2);
 
-            // 收到所有行 → 交换缓冲，更新统计
-            if (rows_received == HEIGHT)
-            {
+            if (rows_received == HEIGHT) {
                 {
-                    std::lock_guard<std::mutex> lk(g_swap_mtx);
-                    std::swap(g_front, g_back);
-                    g_new_frame.store(true, std::memory_order_relaxed);
+                    std::lock_guard<std::mutex> lk(g_raw_mtx);
+                    g_raw_write = 1 - g_raw_write;
+                    g_raw_ready = true;
                 }
+                g_raw_cv.notify_one();
 
                 frame_cnt++;
                 auto now = std::chrono::high_resolution_clock::now();
                 double elapsed = std::chrono::duration<double>(now - last_time).count();
-                double fps = 1.0 / elapsed;
-
                 std::cout << "\rFrame " << frame_cnt
                           << " rows: " << rows_received << "/" << HEIGHT
-                          << " FPS: " << fps << std::flush;
-
+                          << " FPS: " << 1.0 / elapsed << std::flush;
                 std::fill(received.begin(), received.end(), 0);
                 rows_received = 0;
                 last_time = now;
