@@ -38,6 +38,11 @@ static bool                    g_disp_ready = false;
 // ROI
 static std::atomic<int> g_x1{0}, g_y1{0}, g_x2{WIDTH}, g_y2{HEIGHT};
 
+// 采集帧率（接收线程更新，显示线程读）
+static std::atomic<double> g_capture_fps{0.0};
+// 显示帧率（显示线程自己统计）
+static std::atomic<double> g_display_fps{0.0};
+
 void decode_thread()
 {
     while (true)
@@ -76,6 +81,8 @@ void decode_thread()
 void display_thread()
 {
     cv::Mat show;
+    auto last_disp = std::chrono::steady_clock::now();
+
     while (true)
     {
         {
@@ -85,6 +92,14 @@ void display_thread()
             g_disp_ready = false;
         }
 
+        // 统计显示帧率
+        auto now_disp = std::chrono::steady_clock::now();
+        double disp_elapsed = std::chrono::duration<double>(now_disp - last_disp).count();
+        if (disp_elapsed > 0)
+            g_display_fps.store(1.0 / disp_elapsed, std::memory_order_relaxed);
+        last_disp = now_disp;
+
+        // 画 ROI 框
         int x1 = g_x1, y1 = g_y1, x2 = g_x2, y2 = g_y2;
         int xmin = std::max(0, std::min(x1, x2));
         int xmax = std::min(WIDTH-1,  std::max(x1, x2));
@@ -93,6 +108,17 @@ void display_thread()
         if (xmax > xmin && ymax > ymin)
             cv::rectangle(show, cv::Point(xmin,ymin), cv::Point(xmax,ymax),
                           cv::Scalar(0,255,0), 2);
+
+        // 左上角显示采集帧率和显示帧率
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Cap:%.1f  Disp:%.1f",
+                 g_capture_fps.load(), g_display_fps.load());
+        cv::putText(show, buf, cv::Point(4, 16),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                    cv::Scalar(0, 0, 0), 2, cv::LINE_AA);   // 黑色描边
+        cv::putText(show, buf, cv::Point(4, 16),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                    cv::Scalar(0, 255, 255), 1, cv::LINE_AA); // 黄色字
 
         cv::imshow("FPGA 320x240", show);
         cv::waitKey(1);
@@ -135,7 +161,6 @@ int main()
     std::vector<uint8_t> received(HEIGHT + 2, 0);
     int rows_received = 0;
     int frame_cnt = 0;
-    bool in_frame = false;
     auto last_time = std::chrono::high_resolution_clock::now();
 
     long long dbg_pkts = 0;
@@ -208,9 +233,12 @@ int main()
                 frame_cnt++;
                 auto now = std::chrono::high_resolution_clock::now();
                 double elapsed = std::chrono::duration<double>(now - last_time).count();
+                double fps = 1.0 / elapsed;
+                g_capture_fps.store(fps, std::memory_order_relaxed);
+
                 std::cout << "\rFrame " << frame_cnt
                           << " rows: " << rows_received << "/" << HEIGHT
-                          << " FPS: " << 1.0 / elapsed << std::flush;
+                          << " Cap FPS: " << fps << std::flush;
                 std::fill(received.begin(), received.end(), 0);
                 rows_received = 0;
                 last_time = now;
