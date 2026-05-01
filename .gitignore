@@ -6,6 +6,7 @@ __pycache__/
 *.pyc
 
 # 工具链（重点！）
+lubancat_ai_manual_code/
 rknn-toolkit2-1.5.0/
 
 # 鍥剧墖鏁版嵁
