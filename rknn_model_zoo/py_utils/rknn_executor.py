@@ -1,18 +1,15 @@
-from rknn.api import RKNN
+from rknnlite.api import RKNNLite
 
 
 class RKNN_model_container():
     def __init__(self, model_path, target=None, device_id=None) -> None:
-        rknn = RKNN()
+        rknn = RKNNLite()
 
         # Direct Load RKNN Model
         rknn.load_rknn(model_path)
 
         print('--> Init runtime environment')
-        if target==None:
-            ret = rknn.init_runtime()
-        else:
-            ret = rknn.init_runtime(target=target, device_id=device_id)
+        ret = rknn.init_runtime()
         if ret != 0:
             print('Init runtime environment failed')
             exit(ret)

@@ -5,6 +5,9 @@
 __pycache__/
 *.pyc
 
+# 工具链（重点！）
+rknn-toolkit2-1.5.0/
+
 # 鍥剧墖鏁版嵁
 *.jpg
 *.png
