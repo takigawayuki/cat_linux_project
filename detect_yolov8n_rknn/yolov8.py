@@ -16,7 +16,7 @@ from py_utils.coco_utils import COCO_test_helper
 import numpy as np
 
 
-OBJ_THRESH = 0.25
+OBJ_THRESH = 0.70
 NMS_THRESH = 0.45
 
 # The follew two param is for map test
@@ -90,81 +90,55 @@ def nms_boxes(boxes, scores):
     keep = np.array(keep)
     return keep
 
-def dfl(position):
-    # Distribution Focal Loss (DFL)
-    import torch
-    x = torch.tensor(position)
-    n,c,h,w = x.shape
-    p_num = 4
-    mc = c//p_num
-    y = x.reshape(n,p_num,mc,h,w)
-    y = y.softmax(2)
-    acc_metrix = torch.tensor(range(mc)).float().reshape(1,1,mc,1,1)
-    y = (y*acc_metrix).sum(2)
-    return y.numpy()
+
+def sigmoid(x):
+    return 1 / (1 + np.exp(-np.clip(x, -50, 50)))
 
 
-def box_process(position):
-    grid_h, grid_w = position.shape[2:4]
-    col, row = np.meshgrid(np.arange(0, grid_w), np.arange(0, grid_h))
-    col = col.reshape(1, 1, grid_h, grid_w)
-    row = row.reshape(1, 1, grid_h, grid_w)
-    grid = np.concatenate((col, row), axis=1)
-    stride = np.array([IMG_SIZE[1]//grid_h, IMG_SIZE[0]//grid_w]).reshape(1,2,1,1)
+def make_grid(nx, ny):
+    xv, yv = np.meshgrid(np.arange(nx), np.arange(ny))
+    return np.stack((xv, yv), 2).reshape(-1, 2)
 
-    position = dfl(position)
-    box_xy  = grid +0.5 -position[:,0:2,:,:]
-    box_xy2 = grid +0.5 +position[:,2:4,:,:]
-    xyxy = np.concatenate((box_xy*stride, box_xy2*stride), axis=1)
 
-    return xyxy
+def yolov8_decode(output):
+    # output shape: (5, 8400) — already decoded: cx, cy, w, h, conf (all in pixel space)
+    cx = output[0]
+    cy = output[1]
+    w  = output[2]
+    h  = output[3]
+    obj = output[4]  # already sigmoid
 
-def post_process(input_data):
-    boxes, scores, classes_conf = [], [], []
-    defualt_branch=3
-    pair_per_branch = len(input_data)//defualt_branch
-    # Python 忽略 score_sum 输出
-    for i in range(defualt_branch):
-        boxes.append(box_process(input_data[pair_per_branch*i]))
-        classes_conf.append(input_data[pair_per_branch*i+1])
-        scores.append(np.ones_like(input_data[pair_per_branch*i+1][:,:1,:,:], dtype=np.float32))
+    x1 = cx - w / 2
+    y1 = cy - h / 2
+    x2 = cx + w / 2
+    y2 = cy + h / 2
 
-    def sp_flatten(_in):
-        ch = _in.shape[1]
-        _in = _in.transpose(0,2,3,1)
-        return _in.reshape(-1, ch)
+    boxes = np.stack([x1, y1, x2, y2], axis=1)
 
-    boxes = [sp_flatten(_v) for _v in boxes]
-    classes_conf = [sp_flatten(_v) for _v in classes_conf]
-    scores = [sp_flatten(_v) for _v in scores]
+    return boxes, obj
 
-    boxes = np.concatenate(boxes)
-    classes_conf = np.concatenate(classes_conf)
-    scores = np.concatenate(scores)
 
-    # filter according to threshold
-    boxes, classes, scores = filter_boxes(boxes, scores, classes_conf)
+def post_process(outputs):
+    output = outputs[0]
+    output = np.squeeze(output)  # (5, 8400)
 
-    # nms
-    nboxes, nclasses, nscores = [], [], []
-    for c in set(classes):
-        inds = np.where(classes == c)
-        b = boxes[inds]
-        c = classes[inds]
-        s = scores[inds]
-        keep = nms_boxes(b, s)
+    boxes, scores = yolov8_decode(output)
 
-        if len(keep) != 0:
-            nboxes.append(b[keep])
-            nclasses.append(c[keep])
-            nscores.append(s[keep])
+    mask = scores > OBJ_THRESH
+    boxes = boxes[mask]
+    scores = scores[mask]
 
-    if not nclasses and not nscores:
+    print(f"[DEBUG] after threshold: {len(boxes)}")
+
+    if len(boxes) == 0:
         return None, None, None
 
-    boxes = np.concatenate(nboxes)
-    classes = np.concatenate(nclasses)
-    scores = np.concatenate(nscores)
+    keep = nms_boxes(boxes, scores)
+    boxes = boxes[keep]
+    scores = scores[keep]
+    classes = np.zeros(len(scores), dtype=np.int32)
+
+    print(f"[DEBUG] after nms: {len(boxes)}")
 
     return boxes, classes, scores
 
@@ -262,7 +236,7 @@ if __name__ == '__main__':
             input_data = input_data.reshape(1,*input_data.shape).astype(np.float32)
             input_data = input_data/255.
         else:
-            input_data = img
+            input_data = img[np.newaxis, :]
 
         outputs = model.run([input_data])
         boxes, classes, scores = post_process(outputs)
