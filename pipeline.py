@@ -21,7 +21,7 @@ DEFAULT_LPR_GREEN  = f'{BASE}/RKNN_NEW/green_re_run1.rknn'
 DEFAULT_TARGET     = 'rk3568'
 
 # 单张图片路径（设为 None 则用 DEFAULT_IMG_FOLDER）
-DEFAULT_IMG_PATH   = "test_photo/Random/03875-89_268-218&516_566&618-561&606_222&618_218&525_566&516-0_0_3_25_30_29_29_32-97-148.jpg"
+DEFAULT_IMG_PATH   = "test_photo/Random/035-3_5-220&504_481&616-478&598_220&616_223&522_481&504-0_0_0_32_0_27_27-155-124.jpg"
 # 文件夹路径（DEFAULT_IMG_PATH 不为 None 时忽略）
 DEFAULT_IMG_FOLDER = f'{BASE}/test_photo/CCPD2019'
 
@@ -31,7 +31,7 @@ DEFAULT_IMG_SAVE   = False  # 保存到 result/
 
 # ── YOLO params ───────────────────────────────────────────────────────────────
 OBJ_THRESH = 0.70
-NMS_THRESH  = 0.45
+NMS_THRESH  = 0.35
 IMG_SIZE    = (640, 640)
 
 # ── LPRNet params ─────────────────────────────────────────────────────────────
@@ -122,7 +122,6 @@ def plate_format_score(text):
 
 
 def lpr_infer_best(crop_bgr, lpr_blue, lpr_green):
-    """Run both models, pick the better result using format score then confidence."""
     inp = lpr_preprocess(crop_bgr)
 
     out_b = lpr_blue.inference(inputs=[inp])
@@ -134,20 +133,11 @@ def lpr_infer_best(crop_bgr, lpr_blue, lpr_green):
     fmt_b = plate_format_score(text_b)
     fmt_g = plate_format_score(text_g)
 
-    # standard blue plate: 7 chars, full format score
-    if fmt_b == 3 and len(text_b) == 7:
-        return text_b, conf_b, 'BLUE'
-    # new-energy green plate: 8 chars
-    if len(text_g) == 8:
-        return text_g, conf_g, 'GREEN'
-    if len(text_b) == 7:
-        return text_b, conf_b, 'BLUE'
-    # fallback: format score → confidence
-    if fmt_g > fmt_b:
-        return text_g, conf_g, 'GREEN'
-    if fmt_b > fmt_g:
-        return text_b, conf_b, 'BLUE'
-    if conf_g >= conf_b:
+    # weighted score: confidence + format bonus
+    score_b = conf_b + fmt_b * 0.1
+    score_g = conf_g + fmt_g * 0.1
+
+    if score_g >= score_b:
         return text_g, conf_g, 'GREEN'
     return text_b, conf_b, 'BLUE'
 
