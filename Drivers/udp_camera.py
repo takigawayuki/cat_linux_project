@@ -18,17 +18,17 @@ TOTAL_PACKETS = 241
 
 class UDPCamera:
     def __init__(self, port=PORT):
-        self._raw     = [np.zeros((HEIGHT, WIDTH), dtype=np.uint16) for _ in range(2)]
-        self._write   = 0
-        self._frame   = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
-        self._roi     = (0, 0, WIDTH, HEIGHT)
-        self._lock    = threading.Lock()
-        self._event   = threading.Event()
-        self.cap_fps  = 0.0
+        self._raw    = [np.zeros((HEIGHT, WIDTH), dtype=np.uint16) for _ in range(2)]
+        self._write  = 0
+        self._frame  = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+        self._roi    = (0, 0, WIDTH, HEIGHT)
+        self._lock   = threading.Lock()
+        self._event  = threading.Event()
+        self.cap_fps = 0.0
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            self._sock.setsockopt(socket.SOL_SOCKET, 41, 64 * 1024 * 1024)  # SO_RCVBUFFORCE
+            self._sock.setsockopt(socket.SOL_SOCKET, 41, 64 * 1024 * 1024)
         except Exception:
             self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024)
         self._sock.bind(('', port))
@@ -52,7 +52,6 @@ class UDPCamera:
 
             payload = data[4:]
 
-            # ROI packet
             if pkt == TOTAL_PACKETS:
                 if len(payload) >= 8:
                     x1, y1, x2, y2 = struct.unpack('!HHHH', payload[:8])
@@ -79,7 +78,6 @@ class UDPCamera:
             self._raw[self._write][row] = pixels
 
             if rows_received == HEIGHT:
-                # RGB565 → BGR888
                 src = self._raw[self._write]
                 r = ((src >> 11) & 0x1F).astype(np.uint8)
                 g = ((src >> 5)  & 0x3F).astype(np.uint8)
@@ -103,10 +101,17 @@ class UDPCamera:
                 rows_received = 0
 
     def read(self):
-        """Block until next frame. Returns (bgr_frame, roi, cap_fps).
-        roi = (x1, y1, x2, y2) in pixel coords, from FPGA ROI packet.
-        """
+        """Block until next frame. Returns (bgr_frame, roi, cap_fps)."""
         self._event.wait()
+        self._event.clear()
+        with self._lock:
+            return self._frame.copy(), self._roi, self.cap_fps
+
+    def read_latest(self, timeout=0.5):
+        """Wait up to timeout for a new frame, then return whatever is current.
+        Returns None only before the very first frame arrives.
+        """
+        self._event.wait(timeout)
         self._event.clear()
         with self._lock:
             return self._frame.copy(), self._roi, self.cap_fps

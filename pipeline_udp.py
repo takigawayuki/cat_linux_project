@@ -30,6 +30,8 @@ CHARS = ['京', '沪', '津', '渝', '冀', '晋', '蒙', '辽', '吉', '黑',
 
 _PROVINCE = set(CHARS[:31])
 _LETTERS  = set('ABCDEFGHJKLMNPQRSTUVWXYZ')
+# 蓝牌7位，绿牌8位（新能源）
+_EXPECTED_LEN = {'BLUE': 7, 'GREEN': 8}
 
 
 def lpr_decode(preds):
@@ -46,6 +48,15 @@ def lpr_decode(preds):
     text = ''.join(result)
     conf = float(np.mean(np.max(probs, axis=0)[seq != blank])) if np.any(seq != blank) else 0.0
     return text, conf
+
+
+def _trim_plate(text, color_tag):
+    """裁剪到期望长度，优先保留省份+字母开头的前N位。"""
+    expected = _EXPECTED_LEN.get(color_tag, 7)
+    if len(text) <= expected:
+        return text
+    # 超长时从头截取期望长度
+    return text[:expected]
 
 
 def plate_format_score(text):
@@ -83,27 +94,34 @@ def lpr_infer_best(crop_bgr, lpr_blue, lpr_green):
     tb, cb = lpr_decode(out_b[0])
     tg, cg = lpr_decode(out_g[0])
 
-    # 先用颜色检测做主路由
     color_hint = detect_plate_color(crop_bgr)
     if color_hint == 'BLUE':
-        return tb, cb, 'BLUE'
+        return _trim_plate(tb, 'BLUE'), cb, 'BLUE'
     if color_hint == 'GREEN':
-        return tg, cg, 'GREEN'
+        return _trim_plate(tg, 'GREEN'), cg, 'GREEN'
 
-    # 颜色不确定时：格式分权重加大，再比置信度
     sb = cb + plate_format_score(tb) * 0.5
     sg = cg + plate_format_score(tg) * 0.5
-    return (tg, cg, 'GREEN') if sg >= sb else (tb, cb, 'BLUE')
+    if sg >= sb:
+        return _trim_plate(tg, 'GREEN'), cg, 'GREEN'
+    return _trim_plate(tb, 'BLUE'), cb, 'BLUE'
+
+
+_draw_font = None
+
+def _get_draw_font():
+    global _draw_font
+    if _draw_font is None:
+        try:    _draw_font = ImageFont.truetype(FONT_PATH, size=18)
+        except: _draw_font = ImageFont.load_default()
+    return _draw_font
 
 
 def draw_result(img_bgr, x1, y1, x2, y2, plate_text, color_tag, conf):
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(img_rgb)
     draw    = ImageDraw.Draw(pil_img)
-    try:
-        font = ImageFont.truetype(FONT_PATH, size=18)
-    except Exception:
-        font = ImageFont.load_default()
+    font  = _get_draw_font()
     color = (0, 220, 0) if color_tag == 'BLUE' else (0, 200, 100)
     draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
     draw.text((x1, max(y1 - 22, 0)),
@@ -135,9 +153,27 @@ def main():
     last_conf  = 0.0
 
     print('Press q or ESC to quit')
-    with UDPCamera() as cam:
+    import queue as _queue
+    frame_q = _queue.Queue(maxsize=1)
+
+    def recv_loop(cam):
         while True:
-            frame, (x1, y1, x2, y2), cap_fps = cam.read()
+            result = cam.read_latest(timeout=0.5)
+            if result is None:
+                continue
+            if frame_q.full():
+                try: frame_q.get_nowait()
+                except _queue.Empty: pass
+            frame_q.put(result)
+
+    with UDPCamera() as cam:
+        import threading as _threading
+        _threading.Thread(target=recv_loop, args=(cam,), daemon=True).start()
+        while True:
+            try:
+                frame, (x1, y1, x2, y2), cap_fps = frame_q.get(timeout=0.5)
+            except _queue.Empty:
+                continue
 
             vis = frame.copy()
 

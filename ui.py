@@ -29,7 +29,8 @@ LPR_BLUE  = f'{BASE}/RKNN_NEW/blue_re_run1.rknn'
 LPR_GREEN = f'{BASE}/RKNN_NEW/green_re_run1.rknn'
 FONT_PATH = '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'
 
-SMOOTH_N       = 3
+SMOOTH_N       = 5          # 投票フレーム数（増やすほど安定、反応は遅くなる）
+ROI_ALPHA      = 0.3        # ROI EMA係数（小さいほど平滑、大きいほど追従が速い）
 DISP_W, DISP_H = 640, 480
 
 BG   = '#1e2330'
@@ -39,11 +40,19 @@ FG   = '#e0e6f0'
 DIM  = '#7a8499'
 GREEN_COLOR = '#4caf50'
 
+# フォントキャッシュ（毎フレーム truetype() を呼ばないように）
+_font_cache: dict = {}
+
+def _get_font(size: int):
+    if size not in _font_cache:
+        _font_cache[size] = PILFont.truetype(FONT_PATH, size=size)
+    return _font_cache[size]
+
 
 # ── PIL 文字工具 ──────────────────────────────────────────────────────────────
 def _pil_label(parent, text, size=11, color=FG, bg=BG, pad_x=4, pad_y=2):
     """返回一个用 PIL NotoSansCJK 渲染文字的 tk.Label（image模式）。"""
-    font = PILFont.truetype(FONT_PATH, size=size)
+    font = _get_font(size)
     bbox = font.getbbox(text or ' ')
     w = max(bbox[2] - bbox[0] + pad_x * 2, 4)
     h = max(bbox[3] - bbox[1] + pad_y * 2, 4)
@@ -58,7 +67,7 @@ def _pil_label(parent, text, size=11, color=FG, bg=BG, pad_x=4, pad_y=2):
 
 def _pil_imgtk(text, size=11, color=FG, bg=BG, pad_x=4, pad_y=2):
     """返回 PIL 渲染的 ImageTk（用于需要动态更新的 Label）。"""
-    font = PILFont.truetype(FONT_PATH, size=size)
+    font = _get_font(size)
     bbox = font.getbbox(text or ' ')
     w = max(bbox[2] - bbox[0] + pad_x * 2, 4)
     h = max(bbox[3] - bbox[1] + pad_y * 2, 4)
@@ -87,10 +96,12 @@ class App(tk.Tk):
         self._last_conf  = 0.0
         self._last_roi   = (0, 0, 0, 0)
         self._img_full_path = ''
+        self._ui_plate_key  = None   # (plate, tag) キャッシュ、変化時のみ再描画
 
         self._build_ui()
         self._load_models_async()
         self.protocol('WM_DELETE_WINDOW', self._on_close)
+        self._canvas_pending = False
 
     # ── UI 构建 ───────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -332,16 +343,46 @@ class App(tk.Tk):
 
     # ── 摄像头模式（UDP）────────────────────────────────────────────────────
     def _run_camera(self):
+        # 用 maxsize=1 的队列：推理慢时自动丢弃旧帧，始终处理最新帧
+        frame_q = queue.Queue(maxsize=1)
+
+        def recv_loop(cam):
+            while self._running:
+                result = cam.read_latest(timeout=0.5)
+                if result is None:
+                    continue
+                # 队列满时丢弃旧帧，放入最新帧
+                if frame_q.full():
+                    try: frame_q.get_nowait()
+                    except queue.Empty: pass
+                frame_q.put(result)
+
         inf_fps = 0.0
         t_last  = time.time()
+        roi_smooth = None   # EMA平滑后的ROI，(x1,y1,x2,y2) float
         try:
             with UDPCamera() as cam:
+                threading.Thread(target=recv_loop, args=(cam,), daemon=True).start()
                 while self._running:
-                    frame, (x1, y1, x2, y2), cap_fps = cam.read()
-                    vis = frame.copy()
+                    try:
+                        frame, (x1, y1, x2, y2), cap_fps = frame_q.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
 
-                    xmin = max(min(x1, x2), 0); xmax = min(max(x1, x2), WIDTH)
-                    ymin = max(min(y1, y2), 0); ymax = min(max(y1, y2), HEIGHT)
+                    # ROI EMA平滑，抑制FPGA定位框跳动
+                    raw_roi = (float(x1), float(y1), float(x2), float(y2))
+                    if roi_smooth is None:
+                        roi_smooth = raw_roi
+                    else:
+                        roi_smooth = tuple(
+                            ROI_ALPHA * r + (1 - ROI_ALPHA) * s
+                            for r, s in zip(raw_roi, roi_smooth)
+                        )
+                    sx1, sy1, sx2, sy2 = (int(v) for v in roi_smooth)
+
+                    vis = frame.copy()
+                    xmin = max(min(sx1, sx2), 0); xmax = min(max(sx1, sx2), WIDTH)
+                    ymin = max(min(sy1, sy2), 0); ymax = min(max(sy1, sy2), HEIGHT)
 
                     if xmax > xmin and ymax > ymin:
                         crop = frame[ymin:ymax, xmin:xmax]
@@ -387,13 +428,17 @@ class App(tk.Tk):
             text=f'CAP {cap_fps:.1f} fps  |  INF {inf_fps:.1f} fps')
 
     def _update_result(self, plate, tag, conf, x1, y1, x2, y2):
-        color_hex = ACC if tag == 'BLUE' else GREEN_COLOR
-        self._plate_imgtk = _pil_imgtk(plate or '—', size=26, color=color_hex,
-                                        bg=CARD, pad_x=6, pad_y=4)
-        self._lbl_plate.configure(image=self._plate_imgtk)
-        type_text = '蓝色车牌' if tag == 'BLUE' else '绿色车牌'
-        self._type_imgtk = _pil_imgtk(type_text, size=10, color=color_hex, bg=CARD)
-        self._lbl_type.configure(image=self._type_imgtk)
+        # 车牌文字和颜色变化时才重新渲染 PIL 图像（避免每帧都调 truetype 渲染）
+        key = (plate or '—', tag)
+        if key != self._ui_plate_key:
+            self._ui_plate_key = key
+            color_hex = ACC if tag == 'BLUE' else GREEN_COLOR
+            self._plate_imgtk = _pil_imgtk(plate or '—', size=26, color=color_hex,
+                                            bg=CARD, pad_x=6, pad_y=4)
+            self._lbl_plate.configure(image=self._plate_imgtk)
+            type_text = '蓝色车牌' if tag == 'BLUE' else '绿色车牌'
+            self._type_imgtk = _pil_imgtk(type_text, size=10, color=color_hex, bg=CARD)
+            self._lbl_type.configure(image=self._type_imgtk)
         self._lbl_score.configure(text=f'{conf:.3f}' if conf else '—')
         self._lbl_x1.configure(text=str(x1))
         self._lbl_y1.configure(text=str(y1))
@@ -401,14 +446,18 @@ class App(tk.Tk):
         self._lbl_y2.configure(text=str(y2))
 
     def _show_frame(self, bgr):
-        rgb   = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        img   = Image.fromarray(rgb).resize((DISP_W, DISP_H), Image.BILINEAR)
-        imgtk = ImageTk.PhotoImage(img)
-        self.after(0, lambda i=imgtk: self._set_canvas(i))
+        # 推理线程调用。_canvas_pending 为 True 时说明主线程还没处理完上一帧，直接丢弃。
+        if self._canvas_pending:
+            return
+        self._canvas_pending = True
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(rgb).resize((DISP_W, DISP_H), Image.BILINEAR)
+        self.after(0, lambda i=img: self._set_canvas(i))
 
-    def _set_canvas(self, imgtk):
-        self._imgtk = imgtk
-        self._canvas.configure(image=imgtk)
+    def _set_canvas(self, img):
+        self._imgtk = ImageTk.PhotoImage(img)
+        self._canvas.configure(image=self._imgtk)
+        self._canvas_pending = False
 
     def _on_close(self):
         self._running = False
