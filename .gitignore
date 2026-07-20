@@ -13,6 +13,8 @@ rknn-toolkit2-1.5.0/
 rknn_model_zoo-2.3.2/
 rknn-toolkit2-2.3.2/
 
+lubancat_ai_manual_code/
+
 # 图片数据
 *.jpg
 *.png
