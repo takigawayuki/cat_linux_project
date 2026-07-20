@@ -9,10 +9,12 @@ constrained CTC beam search stay in Python for easy validation before C++ port.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
-from dataclasses import dataclass
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -65,6 +67,19 @@ LETTERS = set("ABCDEFGHJKLMNPQRSTUVWXYZ")
 ALNUM = DIGITS | LETTERS
 SPECIALS = set("学挂港澳使领警临")
 
+CCPD_PROVINCES = [
+    "皖", "沪", "津", "渝", "冀", "晋", "蒙", "辽", "吉", "黑",
+    "苏", "浙", "京", "闽", "赣", "鲁", "豫", "鄂", "湘", "粤",
+    "桂", "琼", "川", "贵", "云", "藏", "陕", "甘", "青", "宁",
+    "新", "警", "学", "O",
+]
+CCPD_ALPHABETS = [
+    "A", "B", "C", "D", "E", "F", "G", "H", "J", "K",
+    "L", "M", "N", "P", "Q", "R", "S", "T", "U", "V",
+    "W", "X", "Y", "Z", "0", "1", "2", "3", "4", "5",
+    "6", "7", "8", "9", "O",
+]
+
 
 @dataclass
 class Detection:
@@ -76,13 +91,82 @@ class Detection:
 @dataclass
 class PlateResult:
     box: List[int]
+    detection_index: int
     det_score: float
+    estimated_type: str
+    decoded_type: str
+    plate_subtype: str
     plate_type: str
     plate_text: str
     lpr_score: float
     beam_score: float
     raw_text: str
     crop_path: Optional[str]
+    crop_width: int
+    crop_height: int
+    gt_text: Optional[str]
+    match: Optional[bool]
+
+
+class DebugWriter:
+    def __init__(self, output_dir: Path, args: argparse.Namespace):
+        self.debug_dir = output_dir / "debug"
+        self.debug_dir.mkdir(parents=True, exist_ok=True)
+        self.files = []
+        self.image_writer = self._csv_writer("images.csv", [
+            "image", "gt_text", "width", "height", "detection_count", "plate_count",
+            "plate_texts", "best_plate_text", "best_lpr_score", "best_det_score",
+            "yolo_pre_ms", "yolo_infer_ms", "yolo_post_ms", "lpr_total_ms",
+            "total_ms", "vis_path",
+        ])
+        self.det_writer = self._csv_writer("detections.csv", [
+            "image", "detection_index", "class_id", "class_name", "score",
+            "x1", "y1", "x2", "y2", "width", "height", "area",
+        ])
+        self.plate_writer = self._csv_writer("plates.csv", [
+            "image", "plate_index", "detection_index", "gt_text", "match",
+            "det_score", "estimated_type", "decoded_type", "plate_subtype", "plate_type",
+            "plate_text", "raw_text", "lpr_score", "beam_score", "crop_path",
+            "crop_width", "crop_height", "x1", "y1", "x2", "y2",
+        ])
+        self.candidate_writer = self._csv_writer("decode_candidates.csv", [
+            "image", "plate_index", "candidate_rank", "selected", "estimated_type",
+            "plate_type", "plate_subtype", "target_len", "text_len", "length_ok",
+            "text", "lpr_score", "beam_score",
+        ])
+        self.results_jsonl = open(self.debug_dir / "results.jsonl", "w", encoding="utf-8")
+        self.files.append(self.results_jsonl)
+        self.write_config(args)
+
+    def _csv_writer(self, name: str, fieldnames: List[str]) -> csv.DictWriter:
+        handle = open(self.debug_dir / name, "w", newline="", encoding="utf-8-sig")
+        self.files.append(handle)
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        return writer
+
+    def write_config(self, args: argparse.Namespace) -> None:
+        config = vars(args).copy()
+        config.update({
+            "classes": YOLO_CLASSES,
+            "chars_len": len(CHARS),
+            "blank_index": BLANK_INDEX,
+            "img_size": IMG_SIZE,
+            "lpr_size": LPR_SIZE,
+        })
+        with open(self.debug_dir / "run_config.json", "w", encoding="utf-8") as handle:
+            json.dump(config, handle, ensure_ascii=False, indent=2)
+
+    def write_jsonl(self, payload: Dict) -> None:
+        self.results_jsonl.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def flush(self) -> None:
+        for handle in self.files:
+            handle.flush()
+
+    def close(self) -> None:
+        for handle in self.files:
+            handle.close()
 
 
 def image_files(path: Path) -> Iterable[Path]:
@@ -92,6 +176,26 @@ def image_files(path: Path) -> Iterable[Path]:
     for child in sorted(path.iterdir()):
         if child.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}:
             yield child
+
+
+def parse_ccpd_gt(image_path: Path) -> Optional[str]:
+    parts = image_path.stem.split("-")
+    if len(parts) < 5:
+        return None
+    try:
+        labels = [int(v) for v in parts[4].split("_")]
+    except ValueError:
+        return None
+    if len(labels) < 2:
+        return None
+    if labels[0] >= len(CCPD_PROVINCES):
+        return None
+    chars = [CCPD_PROVINCES[labels[0]]]
+    for idx in labels[1:]:
+        if idx >= len(CCPD_ALPHABETS):
+            return None
+        chars.append(CCPD_ALPHABETS[idx])
+    return "".join(chars)
 
 
 def letterbox(im: np.ndarray, new_shape: Tuple[int, int] = IMG_SIZE,
@@ -414,7 +518,7 @@ def constrained_ctc_decode_one(logits: np.ndarray, plate_type: str, plate_subtyp
 
 
 def decode_with_type_fallback(logits: np.ndarray, estimated_type: str, beam_width: int,
-                              beam_topk: int) -> Tuple[str, float, float, str, str]:
+                              beam_topk: int) -> Tuple[str, float, float, str, str, List[Dict]]:
     if estimated_type.startswith("unknown"):
         attempts = [
             ("blue", None),
@@ -431,16 +535,36 @@ def decode_with_type_fallback(logits: np.ndarray, estimated_type: str, beam_widt
         attempts.extend([("blue", None), ("green", None), ("yellow", None), ("black", None)])
 
     seen = set()
+    candidates: List[Dict] = []
     best = ("", 0.0, float("-inf"), estimated_type, "")
+    best_idx = -1
     for plate_type, subtype in attempts:
         key = (plate_type, subtype)
         if key in seen:
             continue
         seen.add(key)
         text, prob, score = constrained_ctc_decode_one(logits, plate_type, subtype, beam_width, beam_topk)
+        target_len = target_len_for_type(plate_type, subtype)
+        candidate = {
+            "candidate_rank": len(candidates),
+            "selected": False,
+            "estimated_type": estimated_type,
+            "plate_type": plate_type,
+            "plate_subtype": subtype or "",
+            "target_len": target_len,
+            "text_len": len(text),
+            "length_ok": len(text) == target_len,
+            "text": text,
+            "lpr_score": prob,
+            "beam_score": score,
+        }
+        candidates.append(candidate)
         if score > best[2]:
             best = (text, prob, score, plate_type, subtype or "")
-    return best
+            best_idx = len(candidates) - 1
+    if best_idx >= 0:
+        candidates[best_idx]["selected"] = True
+    return (*best, candidates)
 
 
 def preprocess_lpr(crop_bgr: np.ndarray, color_order: str) -> np.ndarray:
@@ -501,74 +625,183 @@ def parse_core_mask(name: str) -> Optional[int]:
     return mapping[name]
 
 
-def run_image(args, yolo, lpr, image_path: Path, output_dir: Path) -> List[PlateResult]:
+def write_debug_rows(debug: Optional[DebugWriter], image_path: Path, gt_text: Optional[str],
+                     frame_shape: Tuple[int, int], detections: Sequence[Detection],
+                     plates: Sequence[PlateResult], candidates_by_plate: Dict[int, List[Dict]],
+                     timings: Dict[str, float], vis_path: Optional[str]) -> None:
+    if debug is None:
+        return
+
+    image = str(image_path)
+    height, width = frame_shape
+    best_plate = max(plates, key=lambda p: p.lpr_score, default=None)
+    debug.image_writer.writerow({
+        "image": image,
+        "gt_text": gt_text or "",
+        "width": width,
+        "height": height,
+        "detection_count": len(detections),
+        "plate_count": len(plates),
+        "plate_texts": "|".join(p.plate_text for p in plates),
+        "best_plate_text": best_plate.plate_text if best_plate else "",
+        "best_lpr_score": best_plate.lpr_score if best_plate else "",
+        "best_det_score": best_plate.det_score if best_plate else "",
+        "yolo_pre_ms": timings.get("yolo_pre_ms", 0.0),
+        "yolo_infer_ms": timings.get("yolo_infer_ms", 0.0),
+        "yolo_post_ms": timings.get("yolo_post_ms", 0.0),
+        "lpr_total_ms": timings.get("lpr_total_ms", 0.0),
+        "total_ms": timings.get("total_ms", 0.0),
+        "vis_path": vis_path or "",
+    })
+
+    for det_idx, det in enumerate(detections):
+        x1, y1, x2, y2 = [int(round(v)) for v in det.box]
+        w = max(0, x2 - x1)
+        h = max(0, y2 - y1)
+        debug.det_writer.writerow({
+            "image": image,
+            "detection_index": det_idx,
+            "class_id": det.class_id,
+            "class_name": YOLO_CLASSES[det.class_id],
+            "score": det.score,
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+            "width": w,
+            "height": h,
+            "area": w * h,
+        })
+
+    for plate_idx, plate in enumerate(plates):
+        row = asdict(plate)
+        x1, y1, x2, y2 = plate.box
+        row.update({
+            "image": image,
+            "plate_index": plate_idx,
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+        })
+        debug.plate_writer.writerow(row)
+        for candidate in candidates_by_plate.get(plate_idx, []):
+            c_row = candidate.copy()
+            c_row.update({"image": image, "plate_index": plate_idx})
+            debug.candidate_writer.writerow(c_row)
+    debug.flush()
+
+
+def run_image(args, yolo, lpr, image_path: Path, output_dir: Path,
+              debug: Optional[DebugWriter] = None) -> List[PlateResult]:
+    total_start = time.perf_counter()
     frame = cv2.imread(str(image_path))
     if frame is None:
         print(f"skip unreadable image: {image_path}")
         return []
 
+    gt_text = parse_ccpd_gt(image_path)
+    t0 = time.perf_counter()
     yolo_input, ratio, pad = preprocess_yolo(frame, args.yolo_color)
+    yolo_pre_ms = (time.perf_counter() - t0) * 1000.0
+
+    t0 = time.perf_counter()
     yolo_outputs = yolo.inference(inputs=[yolo_input])
+    yolo_infer_ms = (time.perf_counter() - t0) * 1000.0
+
+    t0 = time.perf_counter()
     detections = postprocess_yolo(yolo_outputs, ratio, pad, frame.shape[:2], args.conf_thres, args.nms_thres)
+    yolo_post_ms = (time.perf_counter() - t0) * 1000.0
 
     crop_dir = output_dir / "crops"
     if args.save_crops:
         crop_dir.mkdir(parents=True, exist_ok=True)
 
     plate_results: List[PlateResult] = []
-    for idx, det in enumerate(detections):
+    candidates_by_plate: Dict[int, List[Dict]] = {}
+    lpr_total_ms = 0.0
+    for det_idx, det in enumerate(detections):
         if det.class_id != 0:
             continue
         crop = crop_with_padding(frame, det.box, args.crop_pad_x, args.crop_pad_y)
         if crop is None:
             continue
+        crop_h, crop_w = crop.shape[:2]
         estimated_type = estimate_plate_type(crop)
         lpr_input = preprocess_lpr(crop, args.lpr_color)
+
+        t0 = time.perf_counter()
         logits = lpr.inference(inputs=[lpr_input])[0]
         raw_text, _ = greedy_debug_decode(logits)
-        text, lpr_score, beam_score, decoded_type, subtype = decode_with_type_fallback(
+        text, lpr_score, beam_score, decoded_type, subtype, candidates = decode_with_type_fallback(
             logits, estimated_type, args.beam_width, args.beam_topk
         )
-        plate_type = decoded_type if not subtype else f"{decoded_type}:{subtype}"
+        lpr_total_ms += (time.perf_counter() - t0) * 1000.0
 
+        plate_type = decoded_type if not subtype else f"{decoded_type}:{subtype}"
         crop_path = None
         if args.save_crops:
-            crop_path = str(crop_dir / f"{image_path.stem}_plate{idx}.jpg")
+            crop_path = str(crop_dir / f"{image_path.stem}_plate{len(plate_results)}.jpg")
             cv2.imwrite(crop_path, crop)
 
+        match = None if gt_text is None else text == gt_text
         plate_results.append(PlateResult(
             box=[int(round(v)) for v in det.box],
+            detection_index=det_idx,
             det_score=det.score,
+            estimated_type=estimated_type,
+            decoded_type=decoded_type,
+            plate_subtype=subtype,
             plate_type=plate_type,
             plate_text=text,
             lpr_score=lpr_score,
             beam_score=beam_score,
             raw_text=raw_text,
             crop_path=crop_path,
+            crop_width=crop_w,
+            crop_height=crop_h,
+            gt_text=gt_text,
+            match=match,
         ))
+        candidates_by_plate[len(plate_results) - 1] = candidates
 
+    vis_path = None
     if args.save_vis:
         output_dir.mkdir(parents=True, exist_ok=True)
         vis = draw_detections(frame, detections, plate_results)
-        cv2.imwrite(str(output_dir / f"{image_path.stem}_vis.jpg"), vis)
+        vis_path = str(output_dir / f"{image_path.stem}_vis.jpg")
+        cv2.imwrite(vis_path, vis)
 
-    print(json.dumps({
+    timings = {
+        "yolo_pre_ms": yolo_pre_ms,
+        "yolo_infer_ms": yolo_infer_ms,
+        "yolo_post_ms": yolo_post_ms,
+        "lpr_total_ms": lpr_total_ms,
+        "total_ms": (time.perf_counter() - total_start) * 1000.0,
+    }
+    payload = {
         "image": str(image_path),
+        "gt_text": gt_text,
+        "timings": timings,
         "detections": [
             {"class": YOLO_CLASSES[d.class_id], "score": d.score, "box": [int(round(v)) for v in d.box]}
             for d in detections
         ],
-        "plates": [plate.__dict__ for plate in plate_results],
-    }, ensure_ascii=False))
+        "plates": [asdict(plate) for plate in plate_results],
+    }
+    print(json.dumps(payload, ensure_ascii=False))
+    if debug is not None:
+        debug.write_jsonl(payload)
+        write_debug_rows(debug, image_path, gt_text, frame.shape[:2], detections, plate_results,
+                         candidates_by_plate, timings, vis_path)
     return plate_results
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run RKNN YOLO + LPRNet plate inference with constrained CTC decode.")
     parser.add_argument("--image", required=True, help="Input image path or image folder.")
     parser.add_argument("--yolo-model", default="fenqusai/rknn/best.rknn")
     parser.add_argument("--lpr-model", default="fenqusai/rknn/lprnet_unified_p15_focus_fp.rknn")
-    parser.add_argument("--output-dir", default="tools/pipeline/result_rknn_plate")
+    parser.add_argument("--output-dir", default="fenqusai/tools/pipeline/result_rknn_plate")
     parser.add_argument("--conf-thres", type=float, default=0.25)
     parser.add_argument("--nms-thres", type=float, default=0.45)
     parser.add_argument("--beam-width", type=int, default=10)
@@ -580,13 +813,16 @@ def main() -> None:
     parser.add_argument("--lpr-color", choices=["bgr", "rgb"], default="bgr",
                         help="Color order fed to LPRNet RKNN. Current convert.py expects uint8 BGR crop when mean/std is in RKNN.")
     parser.add_argument("--core-mask", choices=["default", "core0", "core1", "core2", "core01", "core012", "auto"],
-                        default="core012")
+                        default="default")
     parser.add_argument("--lpr-core-mask", choices=["default", "core0", "core1", "core2", "core01", "core012", "auto"],
                         default="default")
     parser.add_argument("--save-vis", action="store_true", default=True)
     parser.add_argument("--no-save-vis", dest="save_vis", action="store_false")
     parser.add_argument("--save-crops", action="store_true", default=True)
     parser.add_argument("--no-save-crops", dest="save_crops", action="store_false")
+    parser.add_argument("--export-debug", action="store_true", default=True,
+                        help="Write debug CSV/JSONL files under <output-dir>/debug.")
+    parser.add_argument("--no-export-debug", dest="export_debug", action="store_false")
     args = parser.parse_args()
 
     if cv2 is None:
@@ -597,14 +833,17 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    debug = DebugWriter(output_dir, args) if args.export_debug else None
     yolo = load_rknn(args.yolo_model, parse_core_mask(args.core_mask))
     lpr = load_rknn(args.lpr_model, parse_core_mask(args.lpr_core_mask))
     try:
         for img_path in image_files(Path(args.image)):
-            run_image(args, yolo, lpr, img_path, output_dir)
+            run_image(args, yolo, lpr, img_path, output_dir, debug)
     finally:
         yolo.release()
         lpr.release()
+        if debug is not None:
+            debug.close()
 
 
 if __name__ == "__main__":

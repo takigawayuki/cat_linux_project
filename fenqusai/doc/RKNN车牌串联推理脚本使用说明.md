@@ -90,19 +90,70 @@ python3 fenqusai/tools/pipeline/infer_rknn_plate.py \
 
 ### 4.2 跑图片文件夹
 
+`--image` 可以直接传一个图片文件夹，脚本会遍历这个目录下的图片，并为整批结果生成可视化、crop 和调试 CSV/JSONL。
+
 ```bash
 python3 fenqusai/tools/pipeline/infer_rknn_plate.py \
-  --image test_photo/Random \
-  --output-dir fenqusai/tools/pipeline/result_rknn_plate \
+  --image fenqusai/test_photo \
+  --output-dir fenqusai/tools/pipeline/result_rknn_plate_batch \
   --core-mask default \
   --lpr-core-mask default
 ```
 
-脚本会遍历目录下的：
+如果只想跑某个子文件夹：
+
+```bash
+python3 fenqusai/tools/pipeline/infer_rknn_plate.py \
+  --image fenqusai/test_photo/Random \
+  --output-dir fenqusai/tools/pipeline/result_random_p15_fp \
+  --core-mask default \
+  --lpr-core-mask default
+```
+
+脚本会遍历目录第一层下的：
 
 ```text
 .jpg / .jpeg / .png / .bmp
 ```
+
+注意：当前只遍历传入目录的第一层图片，不递归子目录。如果 `fenqusai/test_photo` 下面全是子文件夹，需要分别传具体子文件夹，或后续再给脚本加递归参数。
+
+批量跑完后重点看：
+
+```text
+<output-dir>/debug/images.csv
+<output-dir>/debug/detections.csv
+<output-dir>/debug/plates.csv
+<output-dir>/debug/decode_candidates.csv
+<output-dir>/debug/results.jsonl
+<output-dir>/debug/run_config.json
+```
+
+### 4.2.1 结果目录不要混用
+
+`--output-dir` 是一次实验的输出目录。传不同目录就会生成不同结果集，例如：
+
+```text
+fenqusai/tools/pipeline/result_rknn_plate
+fenqusai/tools/pipeline/result_rknn_plate_batch
+```
+
+这两个不是两种模型结果，只是两次命令用了不同 `--output-dir`。如果两次跑的是同一批图片，就会看到可视化图和 crops 重复。
+
+建议按实验目的命名目录：
+
+```text
+result_p15_fp
+result_p15_i8
+result_yolo_rgb
+result_yolo_bgr
+result_conf025
+result_conf035
+```
+
+如果要重新生成一批干净结果，先删除旧目录，或者换一个新的 `--output-dir`。
+
+注意：`debug/*.csv` 每次运行会重写，但旧的可视化图和旧 crop 如果还在同一个输出目录里，可能会造成误判。因此做正式对比前，推荐使用一个空目录。
 
 ### 4.3 指定模型
 
@@ -205,9 +256,184 @@ crop_path:
 --no-save-crops
 ```
 
-## 6. 关键参数
+默认还会保存调试文件到：
 
-### 6.1 检测阈值
+```text
+<output-dir>/debug/
+```
+
+如果不想导出 CSV/JSONL：
+
+```bash
+--no-export-debug
+```
+
+## 6. 调试文件
+
+脚本默认开启 `--export-debug`，每次运行会重写 `<output-dir>/debug/` 下的调试文件。
+
+### 6.1 run_config.json
+
+记录本次运行参数：
+
+```text
+模型路径
+阈值
+beam_width / beam_topk
+yolo_color / lpr_color
+core_mask
+CHARS 长度和 blank index
+```
+
+用途：对比两次实验时，先确认是不是参数变了。
+
+### 6.2 images.csv
+
+一张图片一行，适合看整体表现。
+
+主要字段：
+
+```text
+image: 图片路径
+gt_text: 从 CCPD 文件名解析出的真值，解析不到则为空
+width / height: 原图尺寸
+detection_count: YOLO 总检测框数量
+plate_count: 进入 LPR 的 plate 数量
+plate_texts: 当前图识别出的车牌文本
+best_plate_text: lpr_score 最高的车牌文本
+best_lpr_score / best_det_score: 最优车牌的识别/检测分数
+yolo_pre_ms / yolo_infer_ms / yolo_post_ms / lpr_total_ms / total_ms: 分阶段耗时
+vis_path: 可视化图片路径
+```
+
+常用分析：
+
+```text
+plate_count = 0:
+  重点看 YOLO 阈值、输入通道、检测模型。
+
+plate_count > 0 但 best_plate_text 为空或异常：
+  重点看 crop、LPR 输入通道、CHARS、constrained decode。
+
+yolo_post_ms 很高：
+  检查 conf_thres 是否太低，导致太多 anchor 进入 DFL/NMS。
+```
+
+### 6.3 detections.csv
+
+一个 YOLO 检测框一行，适合调检测阈值和 NMS。
+
+主要字段：
+
+```text
+image
+detection_index
+class_id / class_name
+score
+x1 / y1 / x2 / y2
+width / height / area
+```
+
+用途：
+
+```text
+1. 看 plate 分数分布，决定 --conf-thres。
+2. 看 car/person/traffic_light 是否误检很多。
+3. 看 plate 框面积是否太小，是否需要调 crop padding 或训练检测模型。
+```
+
+### 6.4 plates.csv
+
+一个送入 LPRNet 的 plate crop 一行，是最重要的调试表。
+
+主要字段：
+
+```text
+image
+plate_index
+detection_index
+gt_text
+match
+det_score
+estimated_type: HSV 粗判类型
+decoded_type / plate_subtype / plate_type: constrained decode 最终选择的类型
+plate_text
+raw_text: greedy 调试输出，不是最终结果
+lpr_score
+beam_score
+crop_path
+crop_width / crop_height
+x1 / y1 / x2 / y2
+```
+
+常用分析：
+
+```text
+match=False 且 raw_text 接近 gt_text:
+  可能是 constrained 规则或 plate_type fallback 顺序有问题。
+
+match=False 且 raw_text 也很乱:
+  优先看 crop 图、LPR 输入通道、重复归一化、LPRNet 模型精度。
+
+estimated_type 和 decoded_type 经常不一致:
+  HSV 粗判不稳，可以调颜色阈值，或弱化对颜色判断的依赖。
+
+crop_width / crop_height 很小:
+  YOLO plate 框太小或太紧，调 --crop-pad-x / --crop-pad-y。
+```
+
+### 6.5 decode_candidates.csv
+
+一个 constrained decode 尝试一行，适合看为什么最终选了某种车牌类型。
+
+主要字段：
+
+```text
+image
+plate_index
+candidate_rank
+selected
+estimated_type
+plate_type / plate_subtype
+target_len
+text_len
+length_ok
+text
+lpr_score
+beam_score
+```
+
+用途：
+
+```text
+1. 看 selected=True 的候选是否真的合理。
+2. 如果 blue 候选正确但 green 候选被选中，比较 beam_score 差距。
+3. 如果所有 length_ok=False，说明模型输出或约束规则没有形成合法长度。
+4. 如果某类特殊牌经常输给普通牌，调 fallback 顺序或规则。
+```
+
+### 6.6 results.jsonl
+
+一张图片一行 JSON，内容和终端打印基本一致，适合后续写脚本二次分析。
+
+例如可以对比两次实验：
+
+```text
+result_p15_fp/debug/plates.csv
+result_p15_i8/debug/plates.csv
+```
+
+重点看：
+
+```text
+同一张图的 plate_text 是否变化
+lpr_score / beam_score 是否明显下降
+省份和特殊字符是否更容易错
+```
+
+## 7. 关键参数
+
+### 7.1 检测阈值
 
 ```bash
 --conf-thres 0.25
@@ -227,7 +453,7 @@ crop_path:
   降低 --nms-thres，例如 0.35。
 ```
 
-### 6.2 YOLO 输入通道
+### 7.2 YOLO 输入通道
 
 ```bash
 --yolo-color rgb
@@ -270,7 +496,7 @@ python3 fenqusai/tools/pipeline/infer_rknn_plate.py \
 
 哪一组检测框和 ONNX/PyTorch 更接近，就用哪一组。
 
-### 6.3 LPRNet 输入通道
+### 7.3 LPRNet 输入通道
 
 ```bash
 --lpr-color bgr
@@ -301,7 +527,7 @@ python3 fenqusai/tools/pipeline/infer_rknn_plate.py \
 
 否则会重复归一化。
 
-### 6.4 beam search 参数
+### 7.4 beam search 参数
 
 ```bash
 --beam-width 10
@@ -320,7 +546,7 @@ CPU 占用高:
   可以试 --beam-width 5 或 --beam-topk 5。
 ```
 
-### 6.5 crop padding
+### 7.5 crop padding
 
 ```bash
 --crop-pad-x 0.08
@@ -342,7 +568,7 @@ CPU 占用高:
 
 如果 crop 包含太多背景，适当减小。
 
-### 6.6 NPU 核心绑定
+### 7.6 NPU 核心绑定
 
 RK3568 运行时请使用：
 
@@ -375,9 +601,9 @@ The core_mask is only supported by ['RK3588', 'RK3576'].
 
 LPRNet 很小，不一定需要占满三个 NPU 核。
 
-## 7. 当前后处理逻辑
+## 8. 当前后处理逻辑
 
-### 7.1 YOLO 后处理
+### 8.1 YOLO 后处理
 
 脚本按 9 输出 RKNN 友好 YOLO 处理：
 
@@ -418,7 +644,7 @@ cls_sum 只是 cls 求和再 clamp 到 0~1 的辅助过滤信号。
 当前脚本最终检测分数不用 cls_sum。
 ```
 
-### 7.2 LPRNet 后处理
+### 8.2 LPRNet 后处理
 
 LPRNet 输出：
 
@@ -485,9 +711,9 @@ black:
   当前规则较宽，允许非 blank 字符
 ```
 
-## 8. 常见问题
+## 9. 常见问题
 
-### 8.1 报错：core_mask is only supported by ['RK3588', 'RK3576']
+### 9.1 报错：core_mask is only supported by ['RK3588', 'RK3576']
 
 如果在 RK3568 上看到类似报错：
 
@@ -521,7 +747,7 @@ python3 fenqusai/tools/pipeline/infer_rknn_plate.py \
 --core-mask core012
 ```
 
-### 8.2 报错：YOLO RKNN should return 9 outputs
+### 9.2 报错：YOLO RKNN should return 9 outputs
 
 说明当前 `--yolo-model` 不是 RKNN 友好的 9 输出 YOLO，可能是普通 YOLO ONNX/RKNN 或带 NMS 的模型。
 
@@ -533,7 +759,7 @@ best.rknn 输出是否仍是 9 outputs
 是否使用了带 NMS 的导出版本
 ```
 
-### 8.3 检测框位置整体偏移
+### 9.3 检测框位置整体偏移
 
 优先检查：
 
@@ -545,7 +771,7 @@ padding 是否用 114
 
 当前脚本已经记录并使用 `ratio/pad` 还原坐标。
 
-### 8.4 检测不到车牌
+### 9.4 检测不到车牌
 
 排查顺序：
 
@@ -556,7 +782,7 @@ padding 是否用 114
 4. 打印 RKNN output shape，确认 9 输出形状符合预期。
 ```
 
-### 8.5 检测框正确，但车牌识别乱码
+### 9.5 检测框正确，但车牌识别乱码
 
 排查顺序：
 
@@ -568,7 +794,7 @@ padding 是否用 114
 5. 确认没有重复归一化。
 ```
 
-### 8.6 raw_text 对，plate_text 不对
+### 9.6 raw_text 对，plate_text 不对
 
 `raw_text` 是 greedy 调试输出，`plate_text` 是 constrained decode 输出。
 
@@ -588,7 +814,7 @@ beam_width/topk 太小
 
 或临时修改 `decode_with_type_fallback()` 的尝试顺序。
 
-### 8.7 plate_text 对，lpr_score 很低
+### 9.7 plate_text 对，lpr_score 很低
 
 `lpr_score` 是 beam log score 按时间步归一化后的粗略概率，不是严格业务置信度。
 
@@ -601,7 +827,7 @@ plate_text 是否长度合法
 beam_score 排名
 ```
 
-## 9. 建议验证流程
+## 10. 建议验证流程
 
 第一轮建议选 10 张固定图片：
 
@@ -656,7 +882,7 @@ python3 fenqusai/tools/pipeline/infer_rknn_plate.py \
 
 如果 INT8 识别省份、特殊牌明显掉点，最终部署优先保留 FP LPRNet。
 
-## 10. 一句话结论
+## 11. 一句话结论
 
 这个脚本的目标不是极限性能，而是先把当前 RKNN 模型的完整后处理链路跑准：
 
