@@ -98,6 +98,8 @@ class PlateResult:
     plate_subtype: str
     plate_type: str
     plate_text: str
+    valid: bool
+    invalid_reason: str
     lpr_score: float
     beam_score: float
     raw_text: str
@@ -126,7 +128,7 @@ class DebugWriter:
         self.plate_writer = self._csv_writer("plates.csv", [
             "image", "plate_index", "detection_index", "gt_text", "match",
             "det_score", "estimated_type", "decoded_type", "plate_subtype", "plate_type",
-            "plate_text", "raw_text", "lpr_score", "beam_score", "crop_path",
+            "plate_text", "valid", "invalid_reason", "raw_text", "lpr_score", "beam_score", "crop_path",
             "crop_width", "crop_height", "x1", "y1", "x2", "y2",
         ])
         self.candidate_writer = self._csv_writer("decode_candidates.csv", [
@@ -590,7 +592,8 @@ def draw_detections(image: np.ndarray, detections: Sequence[Detection], plates: 
         cv2.putText(vis, label, (x1, max(18, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
     for plate in plates:
         x1, y1, _, _ = plate.box
-        label = f"{plate.plate_text} {plate.lpr_score:.2f} [{plate.plate_type}]"
+        status = "" if plate.valid else " INVALID"
+        label = f"{plate.plate_text or 'INVALID'} {plate.lpr_score:.2f} [{plate.plate_type}]{status}"
         cv2.putText(vis, label, (x1, max(42, y1 - 28)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 255, 40), 2, cv2.LINE_AA)
     return vis
 
@@ -634,7 +637,8 @@ def write_debug_rows(debug: Optional[DebugWriter], image_path: Path, gt_text: Op
 
     image = str(image_path)
     height, width = frame_shape
-    best_plate = max(plates, key=lambda p: p.lpr_score, default=None)
+    valid_plates = [p for p in plates if p.valid]
+    best_plate = max(valid_plates, key=lambda p: p.lpr_score, default=None)
     debug.image_writer.writerow({
         "image": image,
         "gt_text": gt_text or "",
@@ -642,8 +646,8 @@ def write_debug_rows(debug: Optional[DebugWriter], image_path: Path, gt_text: Op
         "height": height,
         "detection_count": len(detections),
         "plate_count": len(plates),
-        "plate_texts": "|".join(p.plate_text for p in plates),
-        "best_plate_text": best_plate.plate_text if best_plate else "",
+        "plate_texts": "|".join(p.plate_text for p in plates if p.valid),
+        "best_plate_text": best_plate.plate_text if best_plate and best_plate.valid else "",
         "best_lpr_score": best_plate.lpr_score if best_plate else "",
         "best_det_score": best_plate.det_score if best_plate else "",
         "yolo_pre_ms": timings.get("yolo_pre_ms", 0.0),
@@ -738,13 +742,19 @@ def run_image(args, yolo, lpr, image_path: Path, output_dir: Path,
         )
         lpr_total_ms += (time.perf_counter() - t0) * 1000.0
 
+        selected_candidate = next((c for c in candidates if c.get("selected")), None)
+        valid = bool(text) and bool(selected_candidate and selected_candidate.get("length_ok"))
+        invalid_reason = "" if valid else "invalid_length_or_empty"
+        if not valid:
+            lpr_score = 0.0
+
         plate_type = decoded_type if not subtype else f"{decoded_type}:{subtype}"
         crop_path = None
         if args.save_crops:
             crop_path = str(crop_dir / f"{image_path.stem}_plate{len(plate_results)}.jpg")
             cv2.imwrite(crop_path, crop)
 
-        match = None if gt_text is None else text == gt_text
+        match = None if gt_text is None or not valid else text == gt_text
         plate_results.append(PlateResult(
             box=[int(round(v)) for v in det.box],
             detection_index=det_idx,
@@ -754,6 +764,8 @@ def run_image(args, yolo, lpr, image_path: Path, output_dir: Path,
             plate_subtype=subtype,
             plate_type=plate_type,
             plate_text=text,
+            valid=valid,
+            invalid_reason=invalid_reason,
             lpr_score=lpr_score,
             beam_score=beam_score,
             raw_text=raw_text,

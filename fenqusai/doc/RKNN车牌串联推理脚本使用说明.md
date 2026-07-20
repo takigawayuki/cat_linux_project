@@ -358,6 +358,8 @@ det_score
 estimated_type: HSV 粗判类型
 decoded_type / plate_subtype / plate_type: constrained decode 最终选择的类型
 plate_text
+valid: 是否可作为有效车牌结果参与评估
+invalid_reason: 无效原因，例如 invalid_length_or_empty
 raw_text: greedy 调试输出，不是最终结果
 lpr_score
 beam_score
@@ -369,6 +371,10 @@ x1 / y1 / x2 / y2
 常用分析：
 
 ```text
+valid=False:
+  当前结果不参与正常识别评估，通常是 constrained decode 没有得到合法长度。
+  例如 text_len=3 但 target_len=7 的 “桂A4”。
+
 match=False 且 raw_text 接近 gt_text:
   可能是 constrained 规则或 plate_type fallback 顺序有问题。
 
@@ -408,8 +414,9 @@ beam_score
 ```text
 1. 看 selected=True 的候选是否真的合理。
 2. 如果 blue 候选正确但 green 候选被选中，比较 beam_score 差距。
-3. 如果所有 length_ok=False，说明模型输出或约束规则没有形成合法长度。
-4. 如果某类特殊牌经常输给普通牌，调 fallback 顺序或规则。
+3. 如果 selected=True 但 length_ok=False，脚本会把该 plate 标记为 valid=False，不参与 best_plate_text 和正常 match 评估。
+4. 如果所有 length_ok=False，说明模型输出或约束规则没有形成合法长度。
+5. 如果某类特殊牌经常输给普通牌，调 fallback 顺序或规则。
 ```
 
 ### 6.6 results.jsonl
