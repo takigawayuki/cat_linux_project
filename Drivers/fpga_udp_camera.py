@@ -29,6 +29,7 @@ SO_RCVBUFFORCE = 33
 class FPGAUDPImageProtocol:
     width: int
     height: int
+    packets_per_frame: int = None
     frame_header: int = FRAME_HEADER
     packet_num_bytes: int = 4
     frame_header_bytes: int = 4
@@ -38,6 +39,8 @@ class FPGAUDPImageProtocol:
     def __post_init__(self):
         if self.width <= 0 or self.height <= 0:
             raise ValueError('width and height must be positive')
+        if self.packets_per_frame is not None and self.packets_per_frame < self.height:
+            raise ValueError('packets_per_frame must be greater than or equal to height')
         if self.pixel_bytes != 2:
             raise ValueError('only RGB565/BGR565 2-byte pixels are supported')
         if self.packet_num_bytes != 4:
@@ -49,6 +52,8 @@ class FPGAUDPImageProtocol:
 
     @property
     def total_packets(self):
+        if self.packets_per_frame is not None:
+            return self.packets_per_frame
         return self.height
 
     @property
@@ -76,6 +81,7 @@ class FPGAUDPCamera:
                  partial_publish_interval=0.0, min_partial_rows=1,
                  clear_missing_rows=True, frame_boundary_mode=None,
                  publish_partial_on_boundary=True, pixel_endian='big',
+                 packet_number_mode='header', payload_offset=None,
                  protocol=None, width=None, height=None,
                  frame_header=FRAME_HEADER):
         if protocol is None:
@@ -117,12 +123,15 @@ class FPGAUDPCamera:
         self.first_packets = 0
         self.ignored_packets = 0
         self.bad_packets = 0
+        self.extra_packets = 0
+        self.packet_number_fallbacks = 0
         self.incomplete_frames = 0
         self.partial_lost_rows = 0
         self.max_partial_rows = 0
         self.last_partial_rows = 0
         self.last_packet_num = 0
         self.last_packet_len = 0
+        self.last_packet_number_source = ''
         self.last_src = ''
         self.last_error = ''
 
@@ -144,6 +153,12 @@ class FPGAUDPCamera:
             raise ValueError('pixel_endian must be big or little')
         self._pixel_endian = pixel_endian
         self._pixel_dtype = np.dtype('>u2' if pixel_endian == 'big' else '<u2')
+        if packet_number_mode not in ('header', 'footer', 'auto', 'sequential'):
+            raise ValueError('packet_number_mode must be header, footer, auto, or sequential')
+        if payload_offset is not None and payload_offset < 0:
+            raise ValueError('payload_offset must be non-negative')
+        self._packet_number_mode = packet_number_mode
+        self._payload_offset = payload_offset
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -238,6 +253,42 @@ class FPGAUDPCamera:
         self.bad_packets += 1
         self.last_error = reason
 
+    def _packet_number_candidates(self, raw4):
+        return (
+            int.from_bytes(raw4, 'big'),
+            int.from_bytes(raw4, 'little'),
+            int.from_bytes(raw4[2:4] + raw4[0:2], 'big'),
+            int.from_bytes(bytes((raw4[1], raw4[0], raw4[3], raw4[2])), 'big'),
+        )
+
+    def _first_valid_packet_number(self, raw4):
+        candidates = self._packet_number_candidates(raw4)
+        for pkt in candidates:
+            if 1 <= pkt <= self._total_packets:
+                return pkt
+        return None
+
+    def _decode_packet_number(self, buf, nbytes):
+        header4 = bytes(buf[:4])
+        footer4 = bytes(buf[nbytes - 4:nbytes]) if nbytes >= 4 else b''
+
+        if self._packet_number_mode in ('header', 'auto'):
+            pkt = self._first_valid_packet_number(header4)
+            if pkt is not None:
+                return pkt, 'header', int.from_bytes(header4, 'big')
+
+        if self._packet_number_mode in ('footer', 'auto') and footer4:
+            pkt = self._first_valid_packet_number(footer4)
+            if pkt is not None:
+                return pkt, 'footer', int.from_bytes(footer4, 'big')
+
+        return int.from_bytes(header4, 'big'), '', int.from_bytes(header4, 'big')
+
+    def _sequential_row_packet(self, seq_packet_idx):
+        pkt_in_frame = (seq_packet_idx % self._total_packets) + 1
+        row = pkt_in_frame - 1
+        return pkt_in_frame, row
+
     def _mark_incomplete_frame(self, rows_received):
         self.incomplete_frames += 1
         self.last_partial_rows = rows_received
@@ -256,8 +307,8 @@ class FPGAUDPCamera:
         last_partial_publish = last_time
         prev_pkt = 0
         complete_published = False
+        seq_packet_idx = 0
 
-        unpack_u32 = struct.Struct('!I').unpack_from
         unpack_header = struct.Struct('!IIHH').unpack_from
 
         while not self._stop.is_set():
@@ -281,11 +332,42 @@ class FPGAUDPCamera:
                 self._mark_bad_packet(f'short packet: len={nbytes}')
                 continue
 
-            pkt = unpack_u32(rx_buf, 0)[0]
+            parsed_pkt = 0
+            pkt_source = ''
+            pixel_offset_override = None
+            sequential_packet = False
+
+            if self._packet_number_mode == 'sequential':
+                pkt, _ = self._sequential_row_packet(seq_packet_idx)
+                pkt_source = 'sequential'
+                sequential_packet = True
+            else:
+                pkt, pkt_source, parsed_pkt = self._decode_packet_number(rx_buf, nbytes)
+                if pkt < 1 or pkt > self._total_packets:
+                    if self._packet_number_mode == 'auto' and nbytes >= self._row_bytes:
+                        pkt, _ = self._sequential_row_packet(seq_packet_idx)
+                        pkt_source = 'sequential'
+                        sequential_packet = True
+                        self.packet_number_fallbacks += 1
+                    else:
+                        self.last_packet_num = parsed_pkt
+                        self.last_packet_number_source = pkt_source or 'invalid'
+                        self._mark_bad_packet(f'bad packet number: pkt={parsed_pkt}, len={nbytes}')
+                        continue
+
             self.last_packet_num = pkt
-            if pkt < 1 or pkt > self._total_packets:
-                self._mark_bad_packet(f'bad packet number: pkt={pkt}, len={nbytes}')
+            self.last_packet_number_source = pkt_source
+            seq_packet_idx += 1
+
+            if pkt > self._height:
+                self.extra_packets += 1
+                prev_pkt = pkt
                 continue
+
+            if sequential_packet or pkt_source == 'footer':
+                pixel_offset_override = 0 if self._payload_offset is None else self._payload_offset
+            elif self._payload_offset is not None:
+                pixel_offset_override = self._payload_offset
 
             started_new_frame = False
             if (self._frame_boundary_mode == 'wrap' and rows_received > 0 and
@@ -326,12 +408,17 @@ class FPGAUDPCamera:
                     pixel_offset = 12
                 elif nbytes >= self._row_packet_bytes:
                     pixel_offset = 4
+                elif nbytes >= self._row_bytes:
+                    pixel_offset = 0
                 else:
                     self._mark_bad_packet(
                         f'short packet 1: len={nbytes}, '
                         f'expected={self._row_packet_bytes} or {self._first_packet_bytes}'
                     )
                     continue
+
+                if pixel_offset_override is not None:
+                    pixel_offset = pixel_offset_override
 
                 if self._strict_frame_sync and rows_received:
                     self._mark_incomplete_frame(rows_received)
@@ -361,8 +448,16 @@ class FPGAUDPCamera:
                     continue
 
                 row = pkt - 1
+                pixel_offset = 4
+                if nbytes >= self._row_packet_bytes:
+                    pixel_offset = 4
+                elif nbytes >= self._row_bytes:
+                    pixel_offset = 0
+                if pixel_offset_override is not None:
+                    pixel_offset = pixel_offset_override
+
                 raw[row, :] = np.frombuffer(
-                    rx_buf, dtype=self._pixel_dtype, count=self._width, offset=4,
+                    rx_buf, dtype=self._pixel_dtype, count=self._width, offset=pixel_offset,
                 )
                 if not received[row]:
                     received[row] = True
@@ -442,16 +537,21 @@ class FPGAUDPCamera:
                 'first_packets': self.first_packets,
                 'ignored_packets': self.ignored_packets,
                 'bad_packets': self.bad_packets,
+                'extra_packets': self.extra_packets,
+                'packet_number_fallbacks': self.packet_number_fallbacks,
                 'incomplete_frames': self.incomplete_frames,
                 'partial_lost_rows': self.partial_lost_rows,
                 'max_partial_rows': self.max_partial_rows,
                 'last_partial_rows': self.last_partial_rows,
                 'last_packet_num': self.last_packet_num,
                 'last_packet_len': self.last_packet_len,
+                'last_packet_number_source': self.last_packet_number_source,
                 'last_src': self.last_src,
                 'last_error': self.last_error,
                 'frame_boundary_mode': self._frame_boundary_mode,
                 'pixel_endian': self._pixel_endian,
+                'packet_number_mode': self._packet_number_mode,
+                'payload_offset': self._payload_offset,
                 'width': self._width,
                 'height': self._height,
                 'total_packets': self._total_packets,

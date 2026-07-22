@@ -127,10 +127,6 @@ class PlateResult:
     lpr_score: float
     beam_score: float
     raw_text: str
-    province_verify_status: str
-    verifier_province: str
-    verifier_conf: float
-    verifier_top3: str
     crop_path: Optional[str]
     crop_width: int
     crop_height: int
@@ -157,14 +153,13 @@ class DebugWriter:
             "image", "plate_index", "detection_index", "gt_text", "match",
             "det_score", "estimated_type", "decoded_type", "plate_subtype", "plate_type",
             "plate_text", "valid", "invalid_reason", "raw_text", "lpr_score", "beam_score", "crop_path",
-            "province_verify_status", "verifier_province", "verifier_conf", "verifier_top3",
             "crop_width", "crop_height", "x1", "y1", "x2", "y2",
         ])
         self.candidate_writer = self._csv_writer("decode_candidates.csv", [
             "image", "plate_index", "candidate_rank", "selected", "estimated_type",
-        "plate_type", "plate_subtype", "target_len", "text_len", "length_ok",
-        "text", "lpr_score", "beam_score", "province_aware", "province_char",
-            "province_rank", "province_conf", "province_score", "province_verify_status",
+            "plate_type", "plate_subtype", "target_len", "text_len", "length_ok",
+            "text", "lpr_score", "beam_score", "province_aware", "province_char",
+            "province_rank", "province_conf", "province_score",
         ])
         self.results_jsonl = open(self.debug_dir / "results.jsonl", "w", encoding="utf-8")
         self.files.append(self.results_jsonl)
@@ -418,31 +413,19 @@ def resolve_crop_padding(args: argparse.Namespace) -> Tuple[float, float, float,
 def estimate_plate_type(crop_bgr: np.ndarray) -> str:
     if crop_bgr.size == 0:
         return "unknown_7"
-    h0, w0 = crop_bgr.shape[:2]
-    x1 = int(w0 * 0.08)
-    x2 = int(w0 * 0.92)
-    y1 = int(h0 * 0.12)
-    y2 = int(h0 * 0.88)
-    roi = crop_bgr[y1:y2, x1:x2]
-    if roi.size == 0:
-        roi = crop_bgr
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
     area = float(hsv.shape[0] * hsv.shape[1])
-    blue = np.count_nonzero((h >= 90) & (h <= 140) & (s >= 45) & (v >= 45)) / area
-    green = np.count_nonzero((h >= 32) & (h <= 92) & (s >= 35) & (v >= 45)) / area
-    yellow = np.count_nonzero((h >= 12) & (h <= 45) & (s >= 45) & (v >= 60)) / area
+    blue = np.count_nonzero((h >= 95) & (h <= 135) & (s >= 50) & (v >= 50)) / area
+    green = np.count_nonzero((h >= 35) & (h <= 90) & (s >= 40) & (v >= 45)) / area
+    yellow = np.count_nonzero((h >= 15) & (h <= 40) & (s >= 50) & (v >= 70)) / area
     dark = np.count_nonzero(v <= 65) / area
-    if dark > 0.58 and max(blue, green, yellow) < 0.28:
-        return "black"
-    best_type, best_score = max(
-        [("blue", blue), ("green", green), ("yellow", yellow)],
-        key=lambda item: item[1],
-    )
-    if best_score >= 0.12:
-        if best_type == "green" and blue >= 0.10 and blue > green * 0.75:
-            return "blue"
-        return best_type
+    if green > 0.18 and green >= blue and green >= yellow:
+        return "green"
+    if yellow > 0.18 and yellow >= blue:
+        return "yellow"
+    if blue > 0.18:
+        return "blue"
     if dark > 0.55:
         return "black"
     return "unknown_7"
@@ -1004,107 +987,6 @@ def preprocess_lpr(crop_bgr: np.ndarray, color_order: str) -> np.ndarray:
     return img[np.newaxis, :].astype(np.uint8)
 
 
-def preprocess_province(crop_bgr: np.ndarray, args: argparse.Namespace) -> np.ndarray:
-    img = cv2.resize(crop_bgr, LPR_SIZE, interpolation=cv2.INTER_LINEAR)
-    h, w = img.shape[:2]
-    left_ratio = max(0.2, min(0.8, float(args.province_left_ratio)))
-    crop_w = max(8, min(w, int(round(w * left_ratio))))
-    left = img[:, :crop_w]
-    left = cv2.resize(
-        left,
-        (int(args.province_input_width), int(args.province_input_height)),
-        interpolation=cv2.INTER_LINEAR,
-    )
-    if args.province_color == "rgb":
-        left = cv2.cvtColor(left, cv2.COLOR_BGR2RGB)
-    return left[np.newaxis, :].astype(np.uint8)
-
-
-def softmax_1d(values: np.ndarray) -> np.ndarray:
-    values = values.astype(np.float32).reshape(-1)
-    values = values - np.max(values)
-    exp_values = np.exp(values)
-    return exp_values / max(float(np.sum(exp_values)), 1e-12)
-
-
-def province_logits_to_probs(output) -> np.ndarray:
-    arr = np.asarray(output)
-    arr = np.squeeze(arr)
-    if arr.size != 31:
-        arr = arr.reshape(-1)[:31]
-    return softmax_1d(arr)
-
-
-def format_province_topk(probs: np.ndarray, topk: int = 3) -> str:
-    indexes = np.argsort(probs)[-max(1, topk):][::-1]
-    return "|".join(f"{CHARS[int(i)]}:{float(probs[int(i)]):.4f}" for i in indexes)
-
-
-def verify_or_correct_province(args: argparse.Namespace, province_model, crop_bgr: np.ndarray,
-                               logits: np.ndarray, text: str, lpr_score: float, beam_score: float,
-                               decoded_type: str, subtype: str, estimated_type: str,
-                               candidates: List[Dict]) -> Tuple[str, float, float, str, str, List[Dict], Dict]:
-    info = {
-        "province_verify_status": "disabled",
-        "verifier_province": "",
-        "verifier_conf": 0.0,
-        "verifier_top3": "",
-    }
-    if province_model is None or not args.province_verify:
-        return text, lpr_score, beam_score, decoded_type, subtype, candidates, info
-
-    province_input = preprocess_province(crop_bgr, args)
-    output = province_model.inference(inputs=[province_input])[0]
-    probs = province_logits_to_probs(output)
-    top_idx = int(np.argmax(probs))
-    top_conf = float(probs[top_idx])
-    top_province = CHARS[top_idx]
-    top_indexes = np.argsort(probs)[-max(1, int(args.province_agree_topk)):][::-1].tolist()
-    current_idx = province_idx_from_text(text)
-
-    info.update({
-        "province_verify_status": "no_text" if not text else "disputed_low_conf",
-        "verifier_province": top_province,
-        "verifier_conf": top_conf,
-        "verifier_top3": format_province_topk(probs, 3),
-    })
-    if not text:
-        return text, lpr_score, beam_score, decoded_type, subtype, candidates, info
-
-    if current_idx == top_idx:
-        info["province_verify_status"] = "agree"
-        return text, lpr_score, beam_score, decoded_type, subtype, candidates, info
-
-    if current_idx is not None and current_idx in top_indexes:
-        info["province_verify_status"] = "topk_agree"
-        return text, lpr_score, beam_score, decoded_type, subtype, candidates, info
-
-    if top_conf < args.province_correct_min_conf:
-        return text, lpr_score, beam_score, decoded_type, subtype, candidates, info
-
-    forced_text, forced_lpr_score, forced_beam_score, forced_type, forced_subtype, forced_candidates = decode_with_type_fallback(
-        logits, estimated_type, args.beam_width, args.beam_topk,
-        args.province_aware_decode, args.province_topk,
-        args.province_timesteps, args.province_score_weight,
-        locked_province_idx=top_idx,
-    )
-    forced_selected = next((c for c in forced_candidates if c.get("selected")), None)
-    forced_len_ok = bool(forced_text) and bool(forced_selected and forced_selected.get("length_ok"))
-    min_score = float(lpr_score) * float(args.province_correction_min_lpr_ratio)
-    if forced_len_ok and forced_lpr_score >= min_score:
-        for candidate in candidates:
-            candidate["selected"] = False
-        for candidate in forced_candidates:
-            candidate["candidate_rank"] = len(candidates)
-            candidate["province_verify_status"] = "forced_by_classifier"
-            candidates.append(candidate)
-        info["province_verify_status"] = "corrected"
-        return forced_text, forced_lpr_score, forced_beam_score, forced_type, forced_subtype, candidates, info
-
-    info["province_verify_status"] = "correction_rejected"
-    return text, lpr_score, beam_score, decoded_type, subtype, candidates, info
-
-
 def make_lpr_debug_image(crop_bgr: np.ndarray, color_order: str) -> np.ndarray:
     img = cv2.resize(crop_bgr, LPR_SIZE, interpolation=cv2.INTER_LINEAR)
     if color_order == "rgb":
@@ -1275,7 +1157,7 @@ def write_debug_rows(debug: Optional[DebugWriter], image_path: Path, gt_text: Op
     debug.flush()
 
 
-def run_image(args, yolo, lpr, province, image_path: Path, output_dir: Path,
+def run_image(args, yolo, lpr, image_path: Path, output_dir: Path,
               debug: Optional[DebugWriter] = None) -> List[PlateResult]:
     total_start = time.perf_counter()
     frame = cv2.imread(str(image_path))
@@ -1337,10 +1219,6 @@ def run_image(args, yolo, lpr, province, image_path: Path, output_dir: Path,
             args.province_timesteps, args.province_score_weight,
             locked_province_idx
         )
-        text, lpr_score, beam_score, decoded_type, subtype, candidates, verifier_info = verify_or_correct_province(
-            args, province, crop, logits, text, lpr_score, beam_score,
-            decoded_type, subtype, estimated_type, candidates
-        )
         lpr_total_ms += (time.perf_counter() - t0) * 1000.0
 
         selected_candidate = next((c for c in candidates if c.get("selected")), None)
@@ -1384,11 +1262,7 @@ def run_image(args, yolo, lpr, province, image_path: Path, output_dir: Path,
         if not valid:
             lpr_score = 0.0
 
-        decoded_type_label = decoded_type if not subtype else f"{decoded_type}:{subtype}"
-        if estimated_type in {"blue", "green", "yellow", "black"}:
-            plate_type = estimated_type if not subtype else f"{estimated_type}:{subtype}"
-        else:
-            plate_type = decoded_type_label
+        plate_type = decoded_type if not subtype else f"{decoded_type}:{subtype}"
         crop_path = None
         if args.save_crops:
             crop_path = str(crop_dir / f"{image_path.stem}_plate{len(plate_results)}.jpg")
@@ -1412,10 +1286,6 @@ def run_image(args, yolo, lpr, province, image_path: Path, output_dir: Path,
             lpr_score=lpr_score,
             beam_score=beam_score,
             raw_text=raw_text,
-            province_verify_status=verifier_info["province_verify_status"],
-            verifier_province=verifier_info["verifier_province"],
-            verifier_conf=verifier_info["verifier_conf"],
-            verifier_top3=verifier_info["verifier_top3"],
             crop_path=crop_path,
             crop_width=crop_w,
             crop_height=crop_h,
@@ -1460,8 +1330,6 @@ def main() -> None:
     parser.add_argument("--image", required=True, help="Input image path or image folder.")
     parser.add_argument("--yolo-model", default="fenqusai/rknn/best.rknn")
     parser.add_argument("--lpr-model", default="fenqusai/rknn/lprnet_unified_p15_focus_fp.rknn")
-    parser.add_argument("--province-model", default="",
-                        help="Optional 31-class province classifier RKNN. Empty disables province verification.")
     parser.add_argument("--output-dir", default="fenqusai/tools/pipeline/result_rknn_plate")
     parser.add_argument("--conf-thres", type=float, default=0.25)
     parser.add_argument("--nms-thres", type=float, default=0.45)
@@ -1476,23 +1344,6 @@ def main() -> None:
                         help="How many early CTC timesteps to use for province scoring.")
     parser.add_argument("--province-score-weight", type=float, default=DEFAULT_PROVINCE_SCORE_WEIGHT,
                         help="Weight of province log-score when choosing among fixed-province decodes.")
-    parser.add_argument("--province-verify", action="store_true", default=False,
-                        help="Use --province-model as a conservative province verifier/reranker.")
-    parser.add_argument("--no-province-verify", dest="province_verify", action="store_false")
-    parser.add_argument("--province-input-width", type=int, default=48,
-                        help="Province classifier input width.")
-    parser.add_argument("--province-input-height", type=int, default=24,
-                        help="Province classifier input height.")
-    parser.add_argument("--province-left-ratio", type=float, default=0.45,
-                        help="Left crop ratio from the 94x24 plate image for province classifier.")
-    parser.add_argument("--province-color", choices=["bgr", "rgb"], default="bgr",
-                        help="Color order fed to province classifier RKNN.")
-    parser.add_argument("--province-correct-min-conf", type=float, default=0.35,
-                        help="Minimum province classifier confidence before trying forced-prefix correction.")
-    parser.add_argument("--province-agree-topk", type=int, default=2,
-                        help="Treat LPR province as weakly verified if it is in classifier top-K.")
-    parser.add_argument("--province-correction-min-lpr-ratio", type=float, default=0.75,
-                        help="Accept forced-prefix correction only if its LPR score keeps at least this ratio of the original score.")
     parser.add_argument("--min-province-conf", type=float, default=0.0,
                         help="Mark selected candidates below this province confidence as invalid. 0 disables. Suggested: 0.25–0.35 for aggressive filtering, 0.15 for gentle.")
     parser.add_argument("--reject-province-mismatch", action="store_true", default=False,
@@ -1569,8 +1420,6 @@ def main() -> None:
                         default="default")
     parser.add_argument("--lpr-core-mask", choices=["default", "core0", "core1", "core2", "core01", "core012", "auto"],
                         default="default")
-    parser.add_argument("--province-core-mask", choices=["default", "core0", "core1", "core2", "core01", "core012", "auto"],
-                        default="default")
     parser.add_argument("--save-vis", action="store_true", default=True)
     parser.add_argument("--no-save-vis", dest="save_vis", action="store_false")
     parser.add_argument("--save-crops", action="store_true", default=True)
@@ -1592,24 +1441,15 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.province_model:
-        args.province_verify = True
-
     debug = DebugWriter(output_dir, args) if args.export_debug else None
     yolo = load_rknn(args.yolo_model, parse_core_mask(args.core_mask))
     lpr = load_rknn(args.lpr_model, parse_core_mask(args.lpr_core_mask))
-    province = None
-    if args.province_model:
-        province = load_rknn(args.province_model, parse_core_mask(args.province_core_mask))
-        args.province_verify = True
     try:
         for img_path in image_files(Path(args.image)):
-            run_image(args, yolo, lpr, province, img_path, output_dir, debug)
+            run_image(args, yolo, lpr, img_path, output_dir, debug)
     finally:
         yolo.release()
         lpr.release()
-        if province is not None:
-            province.release()
         if debug is not None:
             debug.close()
 

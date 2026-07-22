@@ -418,31 +418,19 @@ def resolve_crop_padding(args: argparse.Namespace) -> Tuple[float, float, float,
 def estimate_plate_type(crop_bgr: np.ndarray) -> str:
     if crop_bgr.size == 0:
         return "unknown_7"
-    h0, w0 = crop_bgr.shape[:2]
-    x1 = int(w0 * 0.08)
-    x2 = int(w0 * 0.92)
-    y1 = int(h0 * 0.12)
-    y2 = int(h0 * 0.88)
-    roi = crop_bgr[y1:y2, x1:x2]
-    if roi.size == 0:
-        roi = crop_bgr
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
     area = float(hsv.shape[0] * hsv.shape[1])
-    blue = np.count_nonzero((h >= 90) & (h <= 140) & (s >= 45) & (v >= 45)) / area
-    green = np.count_nonzero((h >= 32) & (h <= 92) & (s >= 35) & (v >= 45)) / area
-    yellow = np.count_nonzero((h >= 12) & (h <= 45) & (s >= 45) & (v >= 60)) / area
+    blue = np.count_nonzero((h >= 95) & (h <= 135) & (s >= 50) & (v >= 50)) / area
+    green = np.count_nonzero((h >= 35) & (h <= 90) & (s >= 40) & (v >= 45)) / area
+    yellow = np.count_nonzero((h >= 15) & (h <= 40) & (s >= 50) & (v >= 70)) / area
     dark = np.count_nonzero(v <= 65) / area
-    if dark > 0.58 and max(blue, green, yellow) < 0.28:
-        return "black"
-    best_type, best_score = max(
-        [("blue", blue), ("green", green), ("yellow", yellow)],
-        key=lambda item: item[1],
-    )
-    if best_score >= 0.12:
-        if best_type == "green" and blue >= 0.10 and blue > green * 0.75:
-            return "blue"
-        return best_type
+    if green > 0.18 and green >= blue and green >= yellow:
+        return "green"
+    if yellow > 0.18 and yellow >= blue:
+        return "yellow"
+    if blue > 0.18:
+        return "blue"
     if dark > 0.55:
         return "black"
     return "unknown_7"
@@ -1384,11 +1372,7 @@ def run_image(args, yolo, lpr, province, image_path: Path, output_dir: Path,
         if not valid:
             lpr_score = 0.0
 
-        decoded_type_label = decoded_type if not subtype else f"{decoded_type}:{subtype}"
-        if estimated_type in {"blue", "green", "yellow", "black"}:
-            plate_type = estimated_type if not subtype else f"{estimated_type}:{subtype}"
-        else:
-            plate_type = decoded_type_label
+        plate_type = decoded_type if not subtype else f"{decoded_type}:{subtype}"
         crop_path = None
         if args.save_crops:
             crop_path = str(crop_dir / f"{image_path.stem}_plate{len(plate_results)}.jpg")
