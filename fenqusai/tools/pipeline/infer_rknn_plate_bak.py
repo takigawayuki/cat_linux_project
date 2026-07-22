@@ -41,32 +41,11 @@ except Exception as exc:  # pragma: no cover - this script normally runs on RKNN
 else:
     RKNN_IMPORT_ERROR = None
 
-try:
-    from PIL import Image, ImageDraw, ImageFont
-except Exception:
-    Image = None
-    ImageDraw = None
-    ImageFont = None
-
 
 YOLO_CLASSES = ("plate", "person", "car", "traffic_light")
 STRIDES = (8, 16, 32)
 IMG_SIZE = (640, 640)  # width, height
 LPR_SIZE = (94, 24)    # width, height
-FONT_CANDIDATES = (
-    "C:/Windows/Fonts/NotoSansSC-Regular.ttf",
-    "C:/Windows/Fonts/NotoSansSC-VF.ttf",
-    "C:/Windows/Fonts/msyh.ttc",
-    "C:/Windows/Fonts/simsun.ttc",
-    "C:/Windows/Fonts/simhei.ttf",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.otf",
-    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.otf",
-    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-    "/usr/share/fonts/truetype/arphic/uming.ttc",
-)
 
 # Must match LPRNet_Pytorch/data/load_data.py for unified class_num=74.
 CHARS = [
@@ -87,9 +66,6 @@ DIGITS = set("0123456789")
 LETTERS = set("ABCDEFGHJKLMNPQRSTUVWXYZ")
 ALNUM = DIGITS | LETTERS
 SPECIALS = set("学挂港澳使领警临")
-DEFAULT_PROVINCE_TOPK = 3
-DEFAULT_PROVINCE_TIMESTEPS = 3
-DEFAULT_PROVINCE_SCORE_WEIGHT = 0.04
 
 CCPD_PROVINCES = [
     "皖", "沪", "津", "渝", "冀", "晋", "蒙", "辽", "吉", "黑",
@@ -158,8 +134,7 @@ class DebugWriter:
         self.candidate_writer = self._csv_writer("decode_candidates.csv", [
             "image", "plate_index", "candidate_rank", "selected", "estimated_type",
             "plate_type", "plate_subtype", "target_len", "text_len", "length_ok",
-            "text", "lpr_score", "beam_score", "province_aware", "province_char",
-            "province_rank", "province_conf", "province_score",
+            "text", "lpr_score", "beam_score",
         ])
         self.results_jsonl = open(self.debug_dir / "results.jsonl", "w", encoding="utf-8")
         self.files.append(self.results_jsonl)
@@ -380,34 +355,19 @@ def postprocess_yolo(outputs: Sequence[np.ndarray], ratio: float, pad: Tuple[flo
     return detections
 
 
-def crop_with_padding(
-    image: np.ndarray,
-    box: Sequence[float],
-    pad_left: float,
-    pad_right: float,
-    pad_top: float,
-    pad_bottom: float,
-) -> Optional[np.ndarray]:
+def crop_with_padding(image: np.ndarray, box: Sequence[float], pad_x: float, pad_y: float) -> Optional[np.ndarray]:
     h, w = image.shape[:2]
     x1, y1, x2, y2 = [float(v) for v in box]
     bw, bh = x2 - x1, y2 - y1
     if bw < 2 or bh < 2:
         return None
-    x1 = int(max(0, math.floor(x1 - bw * pad_left)))
-    x2 = int(min(w, math.ceil(x2 + bw * pad_right)))
-    y1 = int(max(0, math.floor(y1 - bh * pad_top)))
-    y2 = int(min(h, math.ceil(y2 + bh * pad_bottom)))
+    x1 = int(max(0, math.floor(x1 - bw * pad_x)))
+    x2 = int(min(w, math.ceil(x2 + bw * pad_x)))
+    y1 = int(max(0, math.floor(y1 - bh * pad_y)))
+    y2 = int(min(h, math.ceil(y2 + bh * pad_y)))
     if x2 - x1 < 20 or y2 - y1 < 8:
         return None
     return image[y1:y2, x1:x2].copy()
-
-
-def resolve_crop_padding(args: argparse.Namespace) -> Tuple[float, float, float, float]:
-    pad_left = args.crop_pad_left if args.crop_pad_left is not None else args.crop_pad_x
-    pad_right = args.crop_pad_right if args.crop_pad_right is not None else args.crop_pad_x
-    pad_top = args.crop_pad_top if args.crop_pad_top is not None else args.crop_pad_y
-    pad_bottom = args.crop_pad_bottom if args.crop_pad_bottom is not None else args.crop_pad_y
-    return pad_left, pad_right, pad_top, pad_bottom
 
 
 def estimate_plate_type(crop_bgr: np.ndarray) -> str:
@@ -431,109 +391,6 @@ def estimate_plate_type(crop_bgr: np.ndarray) -> str:
     return "unknown_7"
 
 
-def plate_color_mask(crop_bgr: np.ndarray, plate_type: str) -> np.ndarray:
-    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
-    if plate_type == "blue":
-        mask = (h >= 90) & (h <= 140) & (s >= 35) & (v >= 35)
-    elif plate_type == "green":
-        mask = (h >= 30) & (h <= 95) & (s >= 25) & (v >= 35)
-    elif plate_type == "yellow":
-        mask = (h >= 12) & (h <= 45) & (s >= 35) & (v >= 55)
-    elif plate_type == "black":
-        mask = (v <= 90) & (s <= 120)
-    else:
-        blue = (h >= 90) & (h <= 140) & (s >= 35) & (v >= 35)
-        green = (h >= 30) & (h <= 95) & (s >= 25) & (v >= 35)
-        yellow = (h >= 12) & (h <= 45) & (s >= 35) & (v >= 55)
-        mask = blue | green | yellow
-    mask = mask.astype(np.uint8) * 255
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    return mask
-
-
-def refine_plate_crop_by_color(crop_bgr: np.ndarray, plate_type: str, args: argparse.Namespace) -> np.ndarray:
-    if not args.refine_plate_crop or crop_bgr.size == 0:
-        return crop_bgr
-    h, w = crop_bgr.shape[:2]
-    if w < 30 or h < 10:
-        return crop_bgr
-
-    mask = plate_color_mask(crop_bgr, plate_type)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return crop_bgr
-
-    image_area = float(w * h)
-    candidates = []
-    for contour in contours:
-        x, y, bw, bh = cv2.boundingRect(contour)
-        area = float(bw * bh)
-        if area < image_area * args.refine_min_area_ratio:
-            continue
-        aspect = bw / max(1.0, float(bh))
-        if aspect < args.refine_min_aspect or aspect > args.refine_max_aspect:
-            continue
-        # Prefer wide plate-like components near the centre.  This avoids tiny
-        # green/yellow vehicle-body patches stealing the crop.
-        center_y = y + bh * 0.5
-        center_penalty = abs(center_y - h * 0.5) / max(1.0, h)
-        score = area * (1.0 + min(aspect, 5.0) * 0.08) - image_area * center_penalty * 0.08
-        candidates.append((score, x, y, bw, bh))
-
-    if not candidates:
-        return crop_bgr
-
-    _, x, y, bw, bh = max(candidates, key=lambda item: item[0])
-    px1 = int(max(0, math.floor(x - bw * args.refine_pad_left)))
-    px2 = int(min(w, math.ceil(x + bw + bw * args.refine_pad_right)))
-    py1 = int(max(0, math.floor(y - bh * args.refine_pad_top)))
-    py2 = int(min(h, math.ceil(y + bh + bh * args.refine_pad_bottom)))
-    if px2 - px1 < 20 or py2 - py1 < 8:
-        return crop_bgr
-
-    refined = crop_bgr[py1:py2, px1:px2].copy()
-    refined_area = float(refined.shape[0] * refined.shape[1])
-    if refined_area <= 0 or refined_area > image_area * args.refine_max_area_ratio:
-        return crop_bgr
-    return refined
-
-
-def refine_plate_crop_aspect(crop_bgr: np.ndarray, plate_type: str, args: argparse.Namespace) -> np.ndarray:
-    if not args.refine_plate_aspect or crop_bgr.size == 0:
-        return crop_bgr
-    if plate_type not in {"blue", "green", "yellow"}:
-        return crop_bgr
-    h, w = crop_bgr.shape[:2]
-    if w < 30 or h < 10:
-        return crop_bgr
-    aspect = w / max(1.0, float(h))
-    if aspect >= args.refine_aspect_min:
-        return crop_bgr
-
-    target_h = int(round(w / max(args.refine_aspect_target, 1.0)))
-    target_h = max(8, min(h, target_h))
-    if target_h >= h:
-        return crop_bgr
-
-    mask = plate_color_mask(crop_bgr, plate_type) > 0
-    row_density = mask.mean(axis=1).astype(np.float32)
-    if float(row_density.max()) > 0.05:
-        weights = row_density + 1e-3
-        center = int(round(float(np.sum(np.arange(h) * weights) / np.sum(weights))))
-    else:
-        center = h // 2
-
-    y1 = max(0, center - target_h // 2)
-    y2 = min(h, y1 + target_h)
-    y1 = max(0, y2 - target_h)
-    if y2 - y1 < 8:
-        return crop_bgr
-    return crop_bgr[y1:y2, :].copy()
-
-
 def target_len_for_type(plate_type: str, plate_subtype: Optional[str] = None) -> int:
     if plate_type in {"green", "unknown_8"} or plate_subtype == "tractor_green":
         return 8
@@ -541,14 +398,14 @@ def target_len_for_type(plate_type: str, plate_subtype: Optional[str] = None) ->
 
 
 def char_allowed(ch: str, pos: int, plate_type: str, plate_subtype: Optional[str]) -> bool:
+    if plate_type == "black":
+        return ch != "-"
     if pos == 0:
         return ch in PROVINCES
     if pos == 1:
         if plate_type == "special_7":
             return ch in ALNUM
         return ch in LETTERS
-    if plate_type == "black":
-        return ch in ALNUM or ch in SPECIALS
     if plate_subtype == "tractor_green":
         return ch in ALNUM or ch in {"学", "挂"}
     if plate_type == "yellow":
@@ -614,42 +471,23 @@ def greedy_debug_decode(logits: np.ndarray) -> Tuple[str, float]:
     return text, conf
 
 
-def prefix_matches_forced(prefix: Tuple[int, ...], forced_prefix: Tuple[int, ...]) -> bool:
-    if not forced_prefix:
-        return True
-    if len(prefix) <= len(forced_prefix):
-        return prefix == forced_prefix[:len(prefix)]
-    return prefix[:len(forced_prefix)] == forced_prefix
-
-
 def constrained_ctc_decode_one(logits: np.ndarray, plate_type: str, plate_subtype: Optional[str],
-                               beam_width: int, beam_topk: int,
-                               forced_prefix: Tuple[int, ...] = tuple()) -> Tuple[str, float, float]:
+                               beam_width: int, beam_topk: int) -> Tuple[str, float, float]:
     logits = normalize_lpr_logits(logits)
     log_probs = log_softmax_time(logits)
     target_len = target_len_for_type(plate_type, plate_subtype)
-    forced_prefix = tuple(int(idx) for idx in forced_prefix)
-    if forced_prefix:
-        if len(forced_prefix) > target_len or not is_valid_prefix(forced_prefix, plate_type, plate_subtype):
-            return "", 0.0, float("-inf")
-
     beams: Dict[Tuple[int, ...], float] = {tuple(): 0.0}
 
     for t in range(log_probs.shape[1]):
         top = np.argsort(log_probs[:, t])[-beam_topk:].tolist()
         if BLANK_INDEX not in top:
             top.append(BLANK_INDEX)
-        for idx in forced_prefix:
-            if idx not in top:
-                top.append(idx)
         next_beams: Dict[Tuple[int, ...], float] = {}
         for raw_seq, score in beams.items():
             for idx in top:
                 new_raw = raw_seq + (int(idx),)
                 prefix = ctc_collapse(new_raw)
                 if len(prefix) > target_len:
-                    continue
-                if forced_prefix and not prefix_matches_forced(prefix, forced_prefix):
                     continue
                 if not is_valid_prefix(prefix, plate_type, plate_subtype):
                     continue
@@ -665,15 +503,11 @@ def constrained_ctc_decode_one(logits: np.ndarray, plate_type: str, plate_subtyp
     candidates = []
     for raw_seq, score in beams.items():
         prefix = ctc_collapse(raw_seq)
-        if forced_prefix and not prefix_matches_forced(prefix, forced_prefix):
-            continue
         if len(prefix) == target_len and is_valid_prefix(prefix, plate_type, plate_subtype):
             candidates.append((prefix, score))
     if not candidates:
         for raw_seq, score in beams.items():
             prefix = ctc_collapse(raw_seq)
-            if forced_prefix and not prefix_matches_forced(prefix, forced_prefix):
-                continue
             if prefix and is_valid_prefix(prefix, plate_type, plate_subtype):
                 candidates.append((prefix, score))
     if not candidates:
@@ -685,234 +519,33 @@ def constrained_ctc_decode_one(logits: np.ndarray, plate_type: str, plate_subtyp
     return text, float(math.exp(norm_log_score)), float(score)
 
 
-def logsumexp(values: np.ndarray, axis: Optional[int] = None) -> np.ndarray:
-    max_value = np.max(values, axis=axis, keepdims=True)
-    summed = np.log(np.exp(values - max_value).sum(axis=axis, keepdims=True) + 1e-12) + max_value
-    if axis is None:
-        return np.squeeze(summed)
-    return np.squeeze(summed, axis=axis)
-
-
-def province_scores_from_logits(logits: np.ndarray, timesteps: int) -> np.ndarray:
-    logits = normalize_lpr_logits(logits)
-    log_probs = log_softmax_time(logits)
-    window = max(1, min(int(timesteps), log_probs.shape[1]))
-    province_log_probs = log_probs[:31, :window]
-    # CTC may place the province on any early timestep, so logsumexp is less
-    # brittle than requiring the same province to dominate every timestep.
-    return logsumexp(province_log_probs, axis=1) - math.log(window)
-
-
-def province_confidence(logits: np.ndarray, timesteps: int) -> float:
-    scores = province_scores_from_logits(logits, timesteps)
-    return float(math.exp(float(np.max(scores))))
-
-
-def province_idx_from_text(text: str) -> Optional[int]:
-    if not text:
-        return None
-    try:
-        idx = CHARS.index(text[0])
-    except ValueError:
-        return None
-    return idx if 0 <= idx < 31 else None
-
-
-def first_char_is_province(text: str) -> bool:
-    return bool(text) and text[0] in PROVINCES
-
-
-def province_aware_combined_score(prob: float, province_score: Optional[float], province_score_weight: float) -> float:
-    score = math.log(max(float(prob), 1e-12))
-    if province_score is not None:
-        score += float(province_score_weight) * float(province_score)
-    return score
-
-
-def province_aware_ctc_decode_one(logits: np.ndarray, plate_type: str, plate_subtype: Optional[str],
-                                  beam_width: int, beam_topk: int, province_topk: int,
-                                  province_timesteps: int, province_score_weight: float,
-                                  locked_province_idx: Optional[int] = None) -> Tuple[str, float, float, Dict]:
-    scores = province_scores_from_logits(logits, province_timesteps)
-    province_conf = float(math.exp(float(np.max(scores))))
-    top_count = max(1, min(int(province_topk), len(scores)))
-    top_provinces = np.argsort(scores)[-top_count:][::-1].tolist()
-
-    if locked_province_idx is not None:
-        locked_province_idx = int(locked_province_idx)
-        text, prob, raw_score = constrained_ctc_decode_one(
-            logits, plate_type, plate_subtype, beam_width, beam_topk,
-            forced_prefix=(locked_province_idx,)
-        )
-        province_score = float(scores[locked_province_idx]) if 0 <= locked_province_idx < len(scores) else None
-        return text, prob, raw_score, {
-            "province_aware": True,
-            "province_char": CHARS[locked_province_idx] if 0 <= locked_province_idx < 31 else "",
-            "province_rank": "raw_locked",
-            "province_conf": province_conf,
-            "province_score": province_score if province_score is not None else "",
-        }
-
-    base_text, base_prob, base_raw_score = constrained_ctc_decode_one(
-        logits, plate_type, plate_subtype, beam_width, beam_topk
-    )
-    base_idx = province_idx_from_text(base_text)
-    base_province_score = float(scores[base_idx]) if base_idx is not None else None
-    best = (base_text, base_prob, base_raw_score, {
-        "province_aware": True,
-        "province_char": CHARS[base_idx] if base_idx is not None else (base_text[:1] if base_text else ""),
-        "province_rank": "baseline",
-        "province_conf": province_conf,
-        "province_score": base_province_score if base_province_score is not None else "",
-    })
-    best_combined = province_aware_combined_score(base_prob, base_province_score, province_score_weight)
-
-    for rank, p_idx in enumerate(top_provinces):
-        if base_idx == p_idx:
-            continue
-        forced_prefix = (int(p_idx),)
-        if not is_valid_prefix(forced_prefix, plate_type, plate_subtype):
-            continue
-        text, prob, raw_score = constrained_ctc_decode_one(
-            logits, plate_type, plate_subtype, beam_width, beam_topk, forced_prefix=forced_prefix
-        )
-        if not text:
-            continue
-        province_score = float(scores[p_idx])
-        combined = province_aware_combined_score(prob, province_score, province_score_weight)
-        if combined > best_combined:
-            best_combined = combined
-            best = (text, prob, raw_score, {
-                "province_aware": True,
-                "province_char": CHARS[p_idx],
-                "province_rank": rank,
-                "province_conf": province_conf,
-                "province_score": province_score,
-            })
-
-    return best
-
-
-def candidate_special_count(text: str) -> int:
-    return sum(1 for ch in text if ch in SPECIALS)
-
-
-def candidate_is_plausible(candidate: Dict) -> bool:
-    text = candidate.get("text", "")
-    if not text or not candidate.get("length_ok"):
-        return False
-    special_count = candidate_special_count(text)
-    if special_count > 1:
-        return False
-    if candidate.get("plate_type") not in {"black", "special_7", "yellow"}:
-        return special_count == 0
-    if candidate.get("plate_type") == "yellow":
-        return all(ch not in set("港澳使领警临") for ch in text)
-    return True
-
-
-def candidate_selection_score(candidate: Dict, estimated_type: str, province_score_weight: float) -> float:
-    """Score a decode candidate for best-of-N selection across plate-type attempts.
-
-    Uses *normalised* lpr_score (exp of per-timestep-average log-prob) so that
-    7-char and 8-char decodes are comparable.  Raw beam_score is a sum over
-    time-steps that naturally penalises longer sequences — it must never be used
-    for cross-type comparison.
-    """
-    # Primary signal: per-timestep confidence, already comparable across lengths.
-    score = float(candidate.get("lpr_score", 0.0))
-
-    # Penalise special characters that are implausible for the plate type.
-    score -= 0.15 * candidate_special_count(candidate.get("text", ""))
-
-    # Also keep province confidence in the final cross-type selection.  Without
-    # this, a type bonus can still choose a candidate whose first character has
-    # weak early-timestep support.
-    province_score = candidate.get("province_score")
-    if province_score not in (None, ""):
-        score += float(province_score_weight) * float(province_score)
-
-    # Bonus for matching the colour-estimated type — helps keep green plates
-    # green when a 7-char decode has only marginally higher confidence.
-    cand_type = candidate.get("plate_type", "")
-    if not estimated_type.startswith("unknown"):
-        if cand_type == estimated_type:
-            score += 0.08
-        elif cand_type == "black":
-            # Black is easily confused with other types; strong penalty.
-            score -= 0.25
-        else:
-            # Mild penalty for any other type mismatch.
-            score -= 0.05
-
-    return score
-
-
 def decode_with_type_fallback(logits: np.ndarray, estimated_type: str, beam_width: int,
-                              beam_topk: int, province_aware: bool = True,
-                              province_topk: int = DEFAULT_PROVINCE_TOPK,
-                              province_timesteps: int = DEFAULT_PROVINCE_TIMESTEPS,
-                              province_score_weight: float = DEFAULT_PROVINCE_SCORE_WEIGHT,
-                              locked_province_idx: Optional[int] = None) -> Tuple[str, float, float, str, str, List[Dict]]:
-    """Run constrained CTC decode for each candidate plate type and select the best.
-
-    The order matters for two reasons:
-    1. The *first* length-OK plausible candidate that is selected wins the
-       \"selected\" flag, but the *best* across all attempts is what the caller
-       uses — so ordering only affects the debug CSV, not the final result.
-    2. When estimated_type is known, start with that type + its variants, then
-       fall back through all others so the user can see in the debug output
-       which type produced the winning decode.
-    """
-    # Canonical list of all plate types we consider.
-    ALL_ATTEMPTS = [
-        ("blue", None),
-        ("green", None),
-        ("green", "tractor_green"),
-        ("yellow", None),
-        ("black", None),
-        ("special_7", None),
-        ("unknown_8", None),
-    ]
-
+                              beam_topk: int) -> Tuple[str, float, float, str, str, List[Dict]]:
     if estimated_type.startswith("unknown"):
-        attempts = list(ALL_ATTEMPTS)
+        attempts = [
+            ("blue", None),
+            ("green", None),
+            ("yellow", None),
+            ("black", None),
+            ("special_7", None),
+            ("unknown_8", None),
+        ]
     else:
-        # Put estimated_type + its variants first; then all others in order.
         attempts = [(estimated_type, None)]
         if estimated_type == "green":
             attempts.append(("green", "tractor_green"))
-        for attempt in ALL_ATTEMPTS:
-            if attempt not in attempts:
-                attempts.append(attempt)
+        attempts.extend([("blue", None), ("green", None), ("yellow", None), ("black", None)])
 
     seen = set()
     candidates: List[Dict] = []
+    best = ("", 0.0, float("-inf"), estimated_type, "")
+    best_idx = -1
     for plate_type, subtype in attempts:
         key = (plate_type, subtype)
         if key in seen:
             continue
         seen.add(key)
-        if province_aware:
-            text, prob, score, province_info = province_aware_ctc_decode_one(
-                logits, plate_type, subtype, beam_width, beam_topk,
-                province_topk, province_timesteps, province_score_weight,
-                locked_province_idx
-            )
-        else:
-            forced_prefix = (locked_province_idx,) if locked_province_idx is not None else tuple()
-            text, prob, score = constrained_ctc_decode_one(
-                logits, plate_type, subtype, beam_width, beam_topk, forced_prefix=forced_prefix
-            )
-            scores = province_scores_from_logits(logits, province_timesteps)
-            province_idx = province_idx_from_text(text)
-            province_info = {
-                "province_aware": False,
-                "province_char": text[:1] if text else "",
-                "province_rank": "",
-                "province_conf": float(math.exp(float(np.max(scores)))),
-                "province_score": float(scores[province_idx]) if province_idx is not None else "",
-            }
+        text, prob, score = constrained_ctc_decode_one(logits, plate_type, subtype, beam_width, beam_topk)
         target_len = target_len_for_type(plate_type, subtype)
         candidate = {
             "candidate_rank": len(candidates),
@@ -927,38 +560,13 @@ def decode_with_type_fallback(logits: np.ndarray, estimated_type: str, beam_widt
             "lpr_score": prob,
             "beam_score": score,
         }
-        candidate.update(province_info)
         candidates.append(candidate)
-
-    valid_candidates = [
-        (idx, candidate) for idx, candidate in enumerate(candidates)
-        if candidate["text"] and candidate["length_ok"]
-    ]
-    plausible_candidates = [
-        (idx, candidate) for idx, candidate in valid_candidates
-        if candidate_is_plausible(candidate)
-    ]
-    selectable = plausible_candidates or valid_candidates or [
-        (idx, candidate) for idx, candidate in enumerate(candidates)
-        if candidate["text"]
-    ]
-    if not selectable:
-        return "", 0.0, float("-inf"), estimated_type, "", candidates
-
-    best_idx, best_candidate = max(
-        selectable,
-        key=lambda item: candidate_selection_score(item[1], estimated_type, province_score_weight),
-    )
+        if score > best[2]:
+            best = (text, prob, score, plate_type, subtype or "")
+            best_idx = len(candidates) - 1
     if best_idx >= 0:
         candidates[best_idx]["selected"] = True
-    return (
-        best_candidate["text"],
-        best_candidate["lpr_score"],
-        best_candidate["beam_score"],
-        best_candidate["plate_type"],
-        best_candidate["plate_subtype"],
-        candidates,
-    )
+    return (*best, candidates)
 
 
 def preprocess_lpr(crop_bgr: np.ndarray, color_order: str) -> np.ndarray:
@@ -968,43 +576,7 @@ def preprocess_lpr(crop_bgr: np.ndarray, color_order: str) -> np.ndarray:
     return img[np.newaxis, :].astype(np.uint8)
 
 
-def load_draw_font(font_path: Optional[str], size: int):
-    if ImageFont is None:
-        return None
-    candidates = [font_path] if font_path else []
-    candidates.extend(FONT_CANDIDATES)
-    for candidate in candidates:
-        if candidate and Path(candidate).exists():
-            try:
-                return ImageFont.truetype(candidate, size=size)
-            except Exception:
-                continue
-    try:
-        return ImageFont.load_default()
-    except Exception:
-        return None
-
-
-def draw_text_utf8(image: np.ndarray, text: str, pos: Tuple[int, int], color: Tuple[int, int, int],
-                   font_path: Optional[str], size: int = 22) -> np.ndarray:
-    if not text:
-        return image
-    if Image is None or ImageDraw is None:
-        safe_text = text.encode("ascii", errors="replace").decode("ascii")
-        cv2.putText(image, safe_text, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
-        return image
-
-    font = load_draw_font(font_path, size)
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(rgb)
-    draw = ImageDraw.Draw(pil_img)
-    bgr = color
-    draw.text(pos, text, fill=(bgr[2], bgr[1], bgr[0]), font=font)
-    return cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-
-
-def draw_detections(image: np.ndarray, detections: Sequence[Detection], plates: Sequence[PlateResult],
-                    font_path: Optional[str] = None) -> np.ndarray:
+def draw_detections(image: np.ndarray, detections: Sequence[Detection], plates: Sequence[PlateResult]) -> np.ndarray:
     vis = image.copy()
     colors = {
         0: (0, 220, 0),
@@ -1012,24 +584,17 @@ def draw_detections(image: np.ndarray, detections: Sequence[Detection], plates: 
         2: (0, 180, 255),
         3: (0, 0, 255),
     }
-    image_h, image_w = vis.shape[:2]
     for det in detections:
         x1, y1, x2, y2 = [int(round(v)) for v in det.box]
         color = colors.get(det.class_id, (220, 220, 220))
-        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-        if det.class_id == 0:
-            continue
         label = f"{YOLO_CLASSES[det.class_id]} {det.score:.2f}"
+        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
         cv2.putText(vis, label, (x1, max(18, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
     for plate in plates:
-        x1, y1, _, y2 = plate.box
-        x1 = max(0, min(x1, image_w - 1))
+        x1, y1, _, _ = plate.box
         status = "" if plate.valid else " INVALID"
         label = f"{plate.plate_text or 'INVALID'} {plate.lpr_score:.2f} [{plate.plate_type}]{status}"
-        label_y = y2 + 6
-        if label_y + 28 > image_h:
-            label_y = max(0, y1 - 30)
-        vis = draw_text_utf8(vis, label, (x1, label_y), (40, 255, 40), font_path)
+        cv2.putText(vis, label, (x1, max(42, y1 - 28)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 255, 40), 2, cv2.LINE_AA)
     return vis
 
 
@@ -1159,48 +724,27 @@ def run_image(args, yolo, lpr, image_path: Path, output_dir: Path,
     plate_results: List[PlateResult] = []
     candidates_by_plate: Dict[int, List[Dict]] = {}
     lpr_total_ms = 0.0
-    crop_pad_left, crop_pad_right, crop_pad_top, crop_pad_bottom = resolve_crop_padding(args)
     for det_idx, det in enumerate(detections):
         if det.class_id != 0:
             continue
-        crop = crop_with_padding(frame, det.box, crop_pad_left, crop_pad_right, crop_pad_top, crop_pad_bottom)
+        crop = crop_with_padding(frame, det.box, args.crop_pad_x, args.crop_pad_y)
         if crop is None:
             continue
-        estimated_type = estimate_plate_type(crop)
-        crop = refine_plate_crop_by_color(crop, estimated_type, args)
-        crop = refine_plate_crop_aspect(crop, estimated_type, args)
-        estimated_type = estimate_plate_type(crop)
         crop_h, crop_w = crop.shape[:2]
+        estimated_type = estimate_plate_type(crop)
         lpr_input = preprocess_lpr(crop, args.lpr_color)
 
         t0 = time.perf_counter()
         logits = lpr.inference(inputs=[lpr_input])[0]
         raw_text, _ = greedy_debug_decode(logits)
-        locked_province_idx = province_idx_from_text(raw_text) if args.preserve_raw_province else None
         text, lpr_score, beam_score, decoded_type, subtype, candidates = decode_with_type_fallback(
-            logits, estimated_type, args.beam_width, args.beam_topk,
-            args.province_aware_decode, args.province_topk,
-            args.province_timesteps, args.province_score_weight,
-            locked_province_idx
+            logits, estimated_type, args.beam_width, args.beam_topk
         )
         lpr_total_ms += (time.perf_counter() - t0) * 1000.0
 
         selected_candidate = next((c for c in candidates if c.get("selected")), None)
         valid = bool(text) and bool(selected_candidate and selected_candidate.get("length_ok"))
         invalid_reason = "" if valid else "invalid_length_or_empty"
-        if valid and lpr_score < args.min_lpr_score:
-            valid = False
-            invalid_reason = "low_lpr_score"
-        if valid and selected_candidate and args.min_province_conf > 0:
-            province_conf = float(selected_candidate.get("province_conf") or 0.0)
-            if province_conf < args.min_province_conf:
-                valid = False
-                invalid_reason = "low_province_conf"
-        if valid and args.reject_hallucinated_province and not first_char_is_province(raw_text):
-            province_conf = float(selected_candidate.get("province_conf") or 0.0) if selected_candidate else 0.0
-            if args.reject_any_hallucinated_province or province_conf < args.hallucinated_province_min_conf:
-                valid = False
-                invalid_reason = "hallucinated_province"
         if not valid:
             lpr_score = 0.0
 
@@ -1236,7 +780,7 @@ def run_image(args, yolo, lpr, image_path: Path, output_dir: Path,
     vis_path = None
     if args.save_vis:
         output_dir.mkdir(parents=True, exist_ok=True)
-        vis = draw_detections(frame, detections, plate_results, args.font_path)
+        vis = draw_detections(frame, detections, plate_results)
         vis_path = str(output_dir / f"{image_path.stem}_vis.jpg")
         cv2.imwrite(vis_path, vis)
 
@@ -1274,67 +818,8 @@ def main() -> None:
     parser.add_argument("--nms-thres", type=float, default=0.45)
     parser.add_argument("--beam-width", type=int, default=10)
     parser.add_argument("--beam-topk", type=int, default=8)
-    parser.add_argument("--province-aware-decode", action="store_true", default=True,
-                        help="Fix a top-K province prefix first, then decode the suffix with constrained CTC.")
-    parser.add_argument("--no-province-aware-decode", dest="province_aware_decode", action="store_false")
-    parser.add_argument("--province-topk", type=int, default=DEFAULT_PROVINCE_TOPK,
-                        help="Number of early-timestep province candidates to try.")
-    parser.add_argument("--province-timesteps", type=int, default=DEFAULT_PROVINCE_TIMESTEPS,
-                        help="How many early CTC timesteps to use for province scoring.")
-    parser.add_argument("--province-score-weight", type=float, default=DEFAULT_PROVINCE_SCORE_WEIGHT,
-                        help="Weight of province log-score when choosing among fixed-province decodes.")
-    parser.add_argument("--min-province-conf", type=float, default=0.0,
-                        help="Mark selected candidates below this province confidence as invalid. 0 disables.")
-    parser.add_argument("--preserve-raw-province", action="store_true", default=True,
-                        help="When raw CTC starts with a province, force final constrained decode to keep that province.")
-    parser.add_argument("--allow-raw-province-change", dest="preserve_raw_province", action="store_false")
-    parser.add_argument("--reject-hallucinated-province", action="store_true", default=True,
-                        help="Mark low-confidence province-filled results invalid when raw CTC did not start with a province.")
-    parser.add_argument("--allow-hallucinated-province", dest="reject_hallucinated_province", action="store_false")
-    parser.add_argument("--reject-any-hallucinated-province", action="store_true", default=True,
-                        help="Reject every province-filled result whose raw CTC text did not start with a province.")
-    parser.add_argument("--allow-confident-hallucinated-province", dest="reject_any_hallucinated_province", action="store_false",
-                        help="Use --hallucinated-province-min-conf instead of rejecting all province-filled results.")
-    parser.add_argument("--hallucinated-province-min-conf", type=float, default=0.02,
-                        help="Minimum province confidence for accepting a province inserted by constrained decode.")
-    parser.add_argument("--min-lpr-score", type=float, default=0.10,
-                        help="Mark decoded plates below this LPR confidence as invalid.")
     parser.add_argument("--crop-pad-x", type=float, default=0.08)
     parser.add_argument("--crop-pad-y", type=float, default=0.15)
-    parser.add_argument("--crop-pad-left", type=float, default=0.25,
-                        help="Extra left padding ratio for plate crop. Province chars are on the left, so this is larger by default.")
-    parser.add_argument("--crop-pad-right", type=float, default=0.10,
-                        help="Extra right padding ratio for plate crop.")
-    parser.add_argument("--crop-pad-top", type=float, default=0.18,
-                        help="Extra top padding ratio for plate crop.")
-    parser.add_argument("--crop-pad-bottom", type=float, default=0.15,
-                        help="Extra bottom padding ratio for plate crop.")
-    parser.add_argument("--refine-plate-crop", action="store_true", default=False,
-                        help="Refine YOLO crop to the coloured plate region before LPRNet.")
-    parser.add_argument("--no-refine-plate-crop", dest="refine_plate_crop", action="store_false")
-    parser.add_argument("--refine-pad-left", type=float, default=0.04,
-                        help="Left padding ratio after colour-based plate crop refinement.")
-    parser.add_argument("--refine-pad-right", type=float, default=0.03,
-                        help="Right padding ratio after colour-based plate crop refinement.")
-    parser.add_argument("--refine-pad-top", type=float, default=0.08,
-                        help="Top padding ratio after colour-based plate crop refinement.")
-    parser.add_argument("--refine-pad-bottom", type=float, default=0.08,
-                        help="Bottom padding ratio after colour-based plate crop refinement.")
-    parser.add_argument("--refine-min-area-ratio", type=float, default=0.18,
-                        help="Minimum candidate colour-region area ratio in the loose crop.")
-    parser.add_argument("--refine-max-area-ratio", type=float, default=0.95,
-                        help="Reject refinement if it keeps almost the whole loose crop.")
-    parser.add_argument("--refine-min-aspect", type=float, default=1.8,
-                        help="Minimum aspect ratio for a colour-region plate candidate.")
-    parser.add_argument("--refine-max-aspect", type=float, default=8.5,
-                        help="Maximum aspect ratio for a colour-region plate candidate.")
-    parser.add_argument("--refine-plate-aspect", action="store_true", default=False,
-                        help="If a coloured plate crop is too tall, trim vertical background while preserving full width.")
-    parser.add_argument("--no-refine-plate-aspect", dest="refine_plate_aspect", action="store_false")
-    parser.add_argument("--refine-aspect-min", type=float, default=3.2,
-                        help="Only apply vertical aspect refinement when crop aspect is below this value.")
-    parser.add_argument("--refine-aspect-target", type=float, default=4.2,
-                        help="Target plate aspect ratio for vertical refinement.")
     parser.add_argument("--yolo-color", choices=["rgb", "bgr"], default="rgb",
                         help="Color order fed to YOLO RKNN after letterbox. Confirm against convert.py/export.")
     parser.add_argument("--lpr-color", choices=["bgr", "rgb"], default="bgr",
@@ -1347,8 +832,6 @@ def main() -> None:
     parser.add_argument("--no-save-vis", dest="save_vis", action="store_false")
     parser.add_argument("--save-crops", action="store_true", default=True)
     parser.add_argument("--no-save-crops", dest="save_crops", action="store_false")
-    parser.add_argument("--font-path", default=None,
-                        help="Optional Chinese font path for visualization, e.g. /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc.")
     parser.add_argument("--export-debug", action="store_true", default=True,
                         help="Write debug CSV/JSONL files under <output-dir>/debug.")
     parser.add_argument("--no-export-debug", dest="export_debug", action="store_false")

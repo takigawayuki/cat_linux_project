@@ -1,8 +1,8 @@
 {
   "image": "fenqusai/test_photo",
   "yolo_model": "fenqusai/rknn/best.rknn",
-  "lpr_model": "fenqusai/rknn/lprnet_unified_p2_province_focus_fp.rknn",
-  "output_dir": "fenqusai/tools/pipeline/result_p2_fp",
+  "lpr_model": "fenqusai/rknn/lprnet_unified_p5_province_balanced_fp.rknn",
+  "output_dir": "fenqusai/tools/pipeline/result_p5_fp_preserve_raw",
   "conf_thres": 0.25,
   "nms_thres": 0.45,
   "beam_width": 10,
@@ -12,6 +12,7 @@
   "province_timesteps": 3,
   "province_score_weight": 0.04,
   "min_province_conf": 0.0,
+  "preserve_raw_province": true,
   "reject_hallucinated_province": true,
   "reject_any_hallucinated_province": true,
   "hallucinated_province_min_conf": 0.02,

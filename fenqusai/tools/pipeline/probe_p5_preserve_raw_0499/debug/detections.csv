@@ -1,0 +1,2 @@
+﻿image,detection_index,class_id,class_name,score,x1,y1,x2,y2,width,height,area
+fenqusai/test_photo/049921875-80_275-250&410_534&587-534&506_259&587_250&469_530&410-0_0_3_17_25_25_30_25-128-23.jpg,0,0,plate,0.89874267578125,255,406,535,591,280,185,51800

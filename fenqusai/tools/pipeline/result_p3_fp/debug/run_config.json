@@ -1,0 +1,35 @@
+{
+  "image": "fenqusai/test_photo",
+  "yolo_model": "fenqusai/rknn/best.rknn",
+  "lpr_model": "fenqusai/rknn/lprnet_unified_p3_clpd_crpd_focus_fp.rknn",
+  "output_dir": "fenqusai/tools/pipeline/result_p3_fp",
+  "conf_thres": 0.25,
+  "nms_thres": 0.45,
+  "beam_width": 10,
+  "beam_topk": 8,
+  "crop_pad_x": 0.08,
+  "crop_pad_y": 0.15,
+  "yolo_color": "rgb",
+  "lpr_color": "bgr",
+  "core_mask": "default",
+  "lpr_core_mask": "default",
+  "save_vis": true,
+  "save_crops": true,
+  "export_debug": true,
+  "classes": [
+    "plate",
+    "person",
+    "car",
+    "traffic_light"
+  ],
+  "chars_len": 74,
+  "blank_index": 73,
+  "img_size": [
+    640,
+    640
+  ],
+  "lpr_size": [
+    94,
+    24
+  ]
+}
