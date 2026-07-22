@@ -21,3 +21,5 @@ already_accept/
 # 图片数据
 *.jpg
 *.png
+
+*.csv
