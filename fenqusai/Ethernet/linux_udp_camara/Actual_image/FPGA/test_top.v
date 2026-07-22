@@ -33,8 +33,8 @@ parameter  DES_MAC   = 48'h3e_f9_49_84_9e_ee;
 
 //目的IP地址 192.168.1.102
 parameter  DES_IP    = {8'd192,8'd168,8'd1,8'd33};
-parameter	    v_disp_a = 135;    
-parameter       h_disp_a = 240;
+parameter	    v_disp_a = 120;    
+parameter       h_disp_a = 160;
 parameter  		video_h_pixel_0 = 11'd480 ;    
 parameter 		video_v_pixel_0 = 11'd270 ;
 parameter H_ACT = 12'd1920;

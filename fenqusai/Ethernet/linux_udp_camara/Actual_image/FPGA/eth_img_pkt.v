@@ -17,10 +17,10 @@ module eth_img_pkt(
     );    
     
 //parameter define
-parameter  CMOS_H_PIXEL = 16'd480;  //ͼ��ˮƽ����ֱ���
-parameter  CMOS_V_PIXEL = 16'd270;  //ͼ��ֱ����ֱ���
-parameter  UDP_DATA_SIZE = 16'd960; //UDP���ݳ��ȣ��������ײ���
-parameter  ETH_TRAN_DELAY = 16'd6375; //֡����ӳ�
+parameter  CMOS_H_PIXEL = 16'd320;  //ͼ��ˮƽ����ֱ���
+parameter  CMOS_V_PIXEL = 16'd240;  //ͼ��ֱ����ֱ���
+parameter  UDP_DATA_SIZE = 16'd640; //UDP���ݳ��ȣ��������ײ���
+parameter  ETH_TRAN_DELAY = 16'd6500; //֡����ӳ�
 //ͼ��֡ͷ,���ڱ�־һ֡���ݵĿ�ʼ
 parameter  IMG_FRAME_HEAD = {32'hf0_5a_a5_0f};
 
